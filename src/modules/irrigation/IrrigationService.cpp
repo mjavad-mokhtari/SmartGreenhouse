@@ -1,0 +1,5 @@
+#include "modules/irrigation/IrrigationService.h"
+void IrrigationService::begin() { pinMode(pumpPin, OUTPUT); pinMode(zonePin, OUTPUT); pinMode(soilPowerPin, OUTPUT); pinMode(soilAdcPin, INPUT); digitalWrite(pumpPin, HIGH); digitalWrite(zonePin, HIGH); digitalWrite(soilPowerPin, LOW); analogReadResolution(12); }
+void IrrigationService::update(uint32_t now) { if (now - lastSoilRead < 5000) return; lastSoilRead = now; digitalWrite(soilPowerPin, HIGH); soilRaw = analogRead(soilAdcPin); digitalWrite(soilPowerPin, LOW); }
+void IrrigationService::setPump(bool on) { pump = on; digitalWrite(pumpPin, on ? LOW : HIGH); led.pulse(); }
+void IrrigationService::appendStatus(JsonObject object) const { JsonObject state = object.createNestedObject("irrigation"); state["pumpOn"] = pump; state["zoneOn"] = zoneOn; state["soilRaw"] = soilRaw; state["soilPercent"] = constrain(map(soilRaw, 3000, 1400, 0, 100), 0, 100); }
