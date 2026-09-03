@@ -1,5 +1,7 @@
 #include "modules/lighting/LightingService.h"
 
+constexpr uint8_t LightingService::CHANNEL_PINS[LIGHTING_CHANNELS];
+
 LightingService::LightingService(RtcManager& rtc, StatusLed& led)
   : rtc(rtc), led(led) {}
 
@@ -40,7 +42,7 @@ bool LightingService::setChannel(uint8_t id, bool on) {
   if (idx < 0) return false;
   channels[idx].state = on;
   writePin(channels[idx].pin, on);
-  led.pulse();
+  led.blink(1, 80);
   return true;
 }
 
@@ -49,7 +51,7 @@ bool LightingService::toggleChannel(uint8_t id) {
   if (idx < 0) return false;
   channels[idx].state = !channels[idx].state;
   writePin(channels[idx].pin, channels[idx].state);
-  led.pulse();
+  led.blink(1, 80);
   return true;
 }
 
@@ -65,7 +67,7 @@ void LightingService::allOn() {
     writePin(channels[i].pin, true);
     delay(20);
   }
-  led.pulse();
+  led.blink(1, 80);
 }
 
 void LightingService::allOff() {
@@ -73,7 +75,7 @@ void LightingService::allOff() {
     channels[i].state = false;
     writePin(channels[i].pin, false);
   }
-  led.pulse();
+  led.blink(1, 80);
 }
 
 bool LightingService::anyOn() const {

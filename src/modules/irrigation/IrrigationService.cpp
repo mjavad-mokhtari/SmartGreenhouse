@@ -4,6 +4,8 @@
 // --- static pin defaults ---
 const uint8_t IrrigationService::DEFAULT_PINS[ZONE_COUNT] = {23, 25, 26, 27};
 
+constexpr int8_t IrrigationService::RELAY_PINS[8];
+
 // --- constructor ---
 IrrigationService::IrrigationService(RtcManager& rtc, StatusLed& led, PreferencesStore& store)
   : rtc(rtc), led(led), store(store) {}
