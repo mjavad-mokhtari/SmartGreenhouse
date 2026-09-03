@@ -86,6 +86,21 @@ inline String syncStatusJson() {
   return out;
 }
 
+inline String eventsJson() {
+  String j = "[";
+  size_t total = _syncCount;
+  for (size_t i = 0; i < total; i++) {
+    size_t idx = (_syncHead + i) % SYNC_RING_SIZE;
+    if (i > 0) j += ",";
+    j += "{\"id\":" + String(_syncEvents[idx].id);
+    j += ",\"type\":\"" + String(_syncEvents[idx].type) + "\"";
+    j += ",\"state\":\"" + String(_syncEvents[idx].state) + "\"";
+    j += ",\"ts\":" + String(_syncEvents[idx].ts) + "}";
+  }
+  j += "]";
+  return j;
+}
+
 inline void syncLoop() {
   if (!_srvEnabled || WiFi.status() != WL_CONNECTED || _srvUrl.length() == 0) {
     _serverOnline = false;

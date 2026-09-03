@@ -61,6 +61,7 @@ private:
 #endif
 
   void handleConfigTime(AsyncWebServerRequest* request);
+  void handleLogs(AsyncWebServerRequest* request);
   void handleConfigWifi(AsyncWebServerRequest* request);
 
   String buildStatusJson();
