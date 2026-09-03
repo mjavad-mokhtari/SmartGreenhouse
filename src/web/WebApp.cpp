@@ -125,17 +125,30 @@ void WebApp::handleZoneAdd(AsyncWebServerRequest* request) {
 }
 
 void WebApp::handleZoneSchedule(AsyncWebServerRequest* request) {
-  String idStr = request->hasParam("id", true) ? request->getParam("id", true)->value() : request->arg("id");
-  String hourStr = request->hasParam("hour", true) ? request->getParam("hour", true)->value() : request->arg("hour");
-  String minStr = request->hasParam("minute", true) ? request->getParam("minute", true)->value() : request->arg("minute");
+  // Read params from URL query string (most reliable for AsyncWebServer POST)
+  String idStr = request->arg("id");
+  String hourStr = request->arg("hour");
+  String minStr = request->arg("minute");
   if (minStr.length() == 0) minStr = request->arg("min");
-  String durStr = request->hasParam("dur", true) ? request->getParam("dur", true)->value() : request->arg("dur");
+  String durStr = request->arg("dur");
 
-  int idx = irrigation.findZone(idStr.toInt());
-  if (idx >= 0 && irrigation.setSchedule(idx, hourStr.toInt(), minStr.toInt(), durStr.toInt()))
+  Serial.printf("SCHEDULE: id=%s h=%s m=%s dur=%s\n",
+    idStr.c_str(), hourStr.c_str(), minStr.c_str(), durStr.c_str());
+
+  int idVal = idStr.length() > 0 ? idStr.toInt() : -1;
+  int hVal = hourStr.length() > 0 ? hourStr.toInt() : 0;
+  int mVal = minStr.length() > 0 ? minStr.toInt() : 0;
+  int dVal = durStr.length() > 0 ? durStr.toInt() : 0;
+  if (dVal == 0) dVal = 15;
+
+  int idx = irrigation.findZone(idVal);
+  if (idx >= 0 && irrigation.setSchedule(idx, (uint8_t)hVal, (uint8_t)mVal, (uint16_t)dVal)) {
+    Serial.printf("SCHEDULE OK: zone %d set to %02d:%02d for %d min\n", idVal, hVal, mVal, dVal);
     sendJson(request, "{\"ok\":true}");
-  else
+  } else {
+    Serial.printf("SCHEDULE FAIL: idx=%d h=%d m=%d d=%d zoneN=%d\n", idx, hVal, mVal, dVal, irrigation.zoneCount());
     sendJson(request, "{\"ok\":false}", 400);
+  }
 }
 
 void WebApp::handlePumpOn(AsyncWebServerRequest* request) {
@@ -464,14 +477,18 @@ function renderSettings(){
 function setSchedule(id){
   const t=document.getElementById('sch-t'+id).value;
   const d=document.getElementById('sch-d'+id).value;
-  if(!t||!d)return;
+  if(!t||!d){alert('Set time and duration first');return;}
   const [h,m]=t.split(':');
-  fetch('/api/zone/schedule?id='+id+'&hour='+h+'&minute='+m+'&dur='+d,{method:'POST'}).then(refresh);
+  var url='/api/zone/schedule?id='+id+'&hour='+h+'&minute='+m+'&dur='+d;
+  fetch(url,{method:'POST'}).then(r=>r.json()).then(function(j){
+    if(j.ok)refresh();
+    else alert('Failed: check Serial monitor for debug');
+  });
 }
 function saveWifi(){
   const ss=document.getElementById('ssid-in').value;
   const pw=document.getElementById('pass-in').value;
-  if(!ss)return;
+  if(!ss){alert('Please enter SSID');return;}
   fetch('/api/config/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ss)+'&password='+encodeURIComponent(pw)})
     .then(()=>setTimeout(()=>location.reload(),4000));
 }
