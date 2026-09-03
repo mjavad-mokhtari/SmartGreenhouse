@@ -385,7 +385,7 @@ function renderIrrigation(s){
     html+='<span class="st '+ (run?'st-run':'st-off') +'">'+ (run?'RUNNING ('+z.remainingSec+'s)':'IDLE') +'</span></div>';
     html+='<div style="font-size:.78rem;color:var(--muted);margin-bottom:6px">Next: '+(z.nextRun||'--')+' | Enabled: '+(z.enabled?'Yes':'No')+'</div>';
     html+='<div class="fr">';
-    html+='<button class="bt bt-g" onclick="api(\'zone/on?id='+z.id+'&dur=15\')">ON</button>';
+    html+='<button class="bt bt-g" onclick="api(\'zone/on?id='+z.id+'&dur='+z.duration+'\')">ON</button>';
     html+='<button class="bt bt-r" onclick="api(\'zone/off?id='+z.id+'\')">OFF</button>';
     html+='</div>';
     html+='<div class="fr">';

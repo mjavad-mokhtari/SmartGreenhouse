@@ -1,4 +1,5 @@
 #include "modules/lighting/LightingService.h"
+#include "sync.h"
 
 constexpr uint8_t LightingService::CHANNEL_PINS[LIGHTING_CHANNELS];
 
@@ -43,6 +44,7 @@ bool LightingService::setChannel(uint8_t id, bool on) {
   channels[idx].state = on;
   writePin(channels[idx].pin, on);
   led.blink(1, 80);
+  queueEvent("light", on ? "on" : "off");
   return true;
 }
 
@@ -52,6 +54,7 @@ bool LightingService::toggleChannel(uint8_t id) {
   channels[idx].state = !channels[idx].state;
   writePin(channels[idx].pin, channels[idx].state);
   led.blink(1, 80);
+  queueEvent("light", channels[idx].state ? "on" : "off");
   return true;
 }
 
@@ -68,6 +71,7 @@ void LightingService::allOn() {
     delay(20);
   }
   led.blink(1, 80);
+  queueEvent("light", "all-on");
 }
 
 void LightingService::allOff() {
@@ -76,6 +80,7 @@ void LightingService::allOff() {
     writePin(channels[i].pin, false);
   }
   led.blink(1, 80);
+  queueEvent("light", "all-off");
 }
 
 bool LightingService::anyOn() const {

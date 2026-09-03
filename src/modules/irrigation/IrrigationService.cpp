@@ -1,4 +1,5 @@
 #include "modules/irrigation/IrrigationService.h"
+#include "sync.h"
 #include <esp_system.h>
 
 // --- static pin defaults ---
@@ -94,7 +95,7 @@ int IrrigationService::soilPercent() const {
 void IrrigationService::setPump(bool on, const char* why) {
   if (!relayAssigned(PUMP_RELAY_CHANNEL)) { pump = false; return; }
   relayWrite(PUMP_RELAY_CHANNEL, on);
-  if (pump != on) { pump = on; triggerLed(); }
+  if (pump != on) { pump = on; triggerLed(); queueEvent("pump", on ? "on" : "off"); }
 }
 
 void IrrigationService::reconcilePump() {
@@ -154,6 +155,7 @@ bool IrrigationService::start(int idx, uint16_t durationMin, const char* reason)
   zoneWrite(z.pin, true);
   reconcilePump();
   triggerLed();
+  queueEvent("zone", "start");
   return true;
 }
 
@@ -166,6 +168,7 @@ bool IrrigationService::stop(int idx, const char* reason) {
   zoneWrite(z.pin, false);
   reconcilePump();
   triggerLed();
+  queueEvent("zone", "stop");
   return true;
 }
 
@@ -223,6 +226,7 @@ void IrrigationService::checkSchedules(uint32_t now) {
     if (zones[i].running) {
       uint32_t elapsedMs = now - zones[i].started;
       if (elapsedMs >= (uint32_t)zones[i].duration * 60000UL) {
+        queueEvent("zone", "completed");
         stop(i, "Completed");
       }
     }
@@ -237,6 +241,7 @@ void IrrigationService::checkSchedules(uint32_t now) {
     if (!z.days[day7(n.dayOfTheWeek())]) continue;
     if (n.hour() != z.hour || n.minute() != z.minute) continue;
     z.ranToday = true;
+    queueEvent("zone", "scheduled");
     start(i, z.duration, "SCHEDULED");
   }
 }

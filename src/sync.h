@@ -14,19 +14,19 @@ struct SyncEvent {
 };
 
 static const size_t SYNC_RING_SIZE = 32;
-static SyncEvent _syncEvents[SYNC_RING_SIZE];
-static size_t _syncHead = 0;
-static size_t _syncCount = 0;
-static uint32_t _syncNextId = 1;
+inline SyncEvent _syncEvents[SYNC_RING_SIZE];
+inline size_t _syncHead = 0;
+inline size_t _syncCount = 0;
+inline uint32_t _syncNextId = 1;
 
-static Preferences _syncPrefs;
-static String _srvUrl = "";
-static bool _srvEnabled = false;
-static bool _serverOnline = false;
-static uint32_t _syncLastAttempt = 0;
-static uint32_t _syncBackoffMs = 30000;
+inline Preferences _syncPrefs;
+inline String _srvUrl = "";
+inline bool _srvEnabled = false;
+inline bool _serverOnline = false;
+inline uint32_t _syncLastAttempt = 0;
+inline uint32_t _syncBackoffMs = 30000;
 static const uint32_t SYNC_MAX_BACKOFF_MS = 900000; // 15 min
-static bool _syncForceNow = false;
+inline bool _syncForceNow = false;
 
 inline void syncLoadConfig() {
   _syncPrefs.begin("sync", false);
@@ -53,6 +53,35 @@ inline void setServerEnabled(bool en) {
   _syncPrefs.end();
   if (!_srvEnabled) _serverOnline = false;
 }
+
+// --- API Key (MANDATORY for remote access) ---
+inline String getApiKey() {
+  _syncPrefs.begin("sync", false);
+  String key = _syncPrefs.getString("api_key", "");
+  _syncPrefs.end();
+  return key;
+}
+
+inline void setApiKey(const String& key) {
+  _syncPrefs.begin("sync", false);
+  _syncPrefs.putString("api_key", key);
+  _syncPrefs.end();
+}
+
+// Returns true only if a key IS set AND the provided key matches.
+// Returns false if no key is set (unconfigured) OR key doesn't match.
+inline bool checkApiKey(const String& provided) {
+  String stored = getApiKey();
+  if (stored.length() == 0) return false;   // MUST be configured
+  return provided == stored;
+}
+
+inline String apiKeySummary() {
+  String key = getApiKey();
+  if (key.length() == 0) return "not-set";
+  return key.substring(0,4) + "****";
+}
+
 
 inline bool serverOnlineFlag() { return _serverOnline; }
 inline size_t pendingCount() { return _syncCount; }
