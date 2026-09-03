@@ -20,8 +20,10 @@ public:
     , LightingService& lighting
 #endif
   );
+
   void begin();
-  void update() {}
+  void update();
+
 private:
   AsyncWebServer server{80};
   RtcManager& rtc;
@@ -32,6 +34,35 @@ private:
 #ifdef MODULE_LIGHTING
   LightingService& lighting;
 #endif
-  void sendStatus(AsyncWebServerRequest* request);
-  static const char* dashboard();
+
+  // Response helpers
+  void sendJson(AsyncWebServerRequest* request, const String& body, int code = 200);
+  void sendJsonObj(AsyncWebServerRequest* request, JsonDocument& doc, int code = 200);
+
+  // Endpoints
+  void handleStatus(AsyncWebServerRequest* request);
+  void handleHealth(AsyncWebServerRequest* request);
+  void handleDashboard(AsyncWebServerRequest* request);
+
+#ifdef MODULE_IRRIGATION
+  void handleZoneOn(AsyncWebServerRequest* request);
+  void handleZoneOff(AsyncWebServerRequest* request);
+  void handleZoneAdd(AsyncWebServerRequest* request);
+  void handleZoneSchedule(AsyncWebServerRequest* request);
+  void handlePumpOn(AsyncWebServerRequest* request);
+  void handlePumpOff(AsyncWebServerRequest* request);
+  void handleAllOff(AsyncWebServerRequest* request);
+#endif
+
+#ifdef MODULE_LIGHTING
+  void handleLightToggle(AsyncWebServerRequest* request);
+  void handleLightAllOn(AsyncWebServerRequest* request);
+  void handleLightAllOff(AsyncWebServerRequest* request);
+#endif
+
+  void handleConfigTime(AsyncWebServerRequest* request);
+  void handleConfigWifi(AsyncWebServerRequest* request);
+
+  String buildStatusJson();
+  String buildFullDashboard();
 };

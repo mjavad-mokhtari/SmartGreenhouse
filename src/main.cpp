@@ -1,288 +1,205 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <Preferences.h>
-#include <RTClib.h>
-#include <Wire.h>
 #include <esp_system.h>
+#include "core/Services.h"
+#ifdef MODULE_IRRIGATION
+#include "modules/irrigation/IrrigationService.h"
+#endif
+#ifdef MODULE_LIGHTING
+#include "modules/lighting/LightingService.h"
+#endif
+#include "web/WebApp.h"
 #include "sync.h"
 
-// --- سخت‌افزار و پین‌ها ---
-static const uint8_t LED_PIN = 2;
-static const uint8_t RELAY_PINS[8] = {13, 12, 14, 27, 26, 25, 33, 32};
-static const uint8_t PUMP_PIN = 13; // زون ۱ (رله ۱) به عنوان پمپ اختصاصی
+// --- Core services ---
+RtcManager rtc;
+StatusLed led(2);
+PreferencesStore sysStore("system");
+PreferencesStore irrStore("irrigation");
+WifiManager wifi(irrStore);
 
-// --- وضعیت سیستم ---
-RTC_DS3231 rtc;
-WebServer web(80);
-Preferences prefs;
+#ifdef MODULE_IRRIGATION
+IrrigationService irrigation(rtc, led, irrStore);
+#endif
 
-bool apMode = false;
-bool pumpState = false;
-bool zoneStates[8] = {false, false, false, false, false, false, false, false};
+#ifdef MODULE_LIGHTING
+LightingService lighting(rtc, led);
+#endif
 
-// تنظیمات زمان‌بندی زون‌ها
-struct ScheduleConfig {
-  bool enabled;
-  uint8_t startHour;
-  uint8_t startMin;
-  uint16_t durationSec;
-  uint8_t daysMask; // بیت ۰ تا ۶ (شنبه تا جمعه)
-};
-ScheduleConfig schedules[8];
-
-// تایمرها
-uint32_t zoneEndMillis[8] = {0};
-
-void blinkLed(int times = 3) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(70);
-    digitalWrite(LED_PIN, LOW);
-    delay(70);
-  }
-  digitalWrite(LED_PIN, pumpState ? HIGH : LOW);
-}
-
-void setPump(bool state) {
-  if (pumpState != state) {
-    pumpState = state;
-    digitalWrite(PUMP_PIN, pumpState ? LOW : HIGH); // رله Active LOW
-    queueEvent("pump", pumpState ? "on" : "off");
-    blinkLed(3);
-  }
-}
-
-void reconcilePump() {
-  bool anyZoneActive = false;
-  // زون‌های ۲ به بعد (ایندکس‌های ۱ تا ۷)
-  for (int i = 1; i < 8; i++) {
-    if (zoneStates[i]) {
-      anyZoneActive = true;
-      break;
-    }
-  }
-  // اگر زون ۱ دستی فعال باشد یا هر زون دیگری باز باشد، پمپ روشن می‌شود
-  if (zoneStates[0] || anyZoneActive) {
-    setPump(true);
-  } else {
-    setPump(false);
-  }
-}
-
-void setZone(int idx, bool state, uint16_t durationSec = 0) {
-  if (idx < 0 || idx >= 8) return;
-  zoneStates[idx] = state;
-  digitalWrite(RELAY_PINS[idx], state ? LOW : HIGH); // Active LOW
-  
-  if (state && durationSec > 0) {
-    zoneEndMillis[idx] = millis() + (durationSec * 1000);
-  } else if (!state) {
-    zoneEndMillis[idx] = 0;
-  }
-  
-  queueEvent("zone", state ? "on" : "off");
-  reconcilePump();
-  blinkLed(3);
-}
-
-void stopAllZones() {
-  for (int i = 0; i < 8; i++) {
-    zoneStates[i] = false;
-    zoneEndMillis[i] = 0;
-    digitalWrite(RELAY_PINS[i], HIGH); // خاموش (Active LOW)
-  }
-  setPump(false);
-  queueEvent("system", "stop_all");
-}
-
-void loadSettings() {
-  prefs.begin("irrigation", true);
-  for (int i = 0; i < 8; i++) {
-    String p = "z" + String(i);
-    schedules[i].enabled = prefs.getBool((p + "_en").c_str(), false);
-    schedules[i].startHour = prefs.getUChar((p + "_sh").c_str(), 8);
-    schedules[i].startMin = prefs.getUChar((p + "_sm").c_str(), 0);
-    schedules[i].durationSec = prefs.getUShort((p + "_du").c_str(), 300);
-    schedules[i].daysMask = prefs.getUChar((p + "_dm").c_str(), 0x7F);
-  }
-  prefs.end();
-}
-
-void saveSchedule(int idx) {
-  if (idx < 0 || idx >= 8) return;
-  prefs.begin("irrigation", false);
-  String p = "z" + String(idx);
-  prefs.putBool((p + "_en").c_str(), schedules[idx].enabled);
-  prefs.putUChar((p + "_sh").c_str(), schedules[idx].startHour);
-  prefs.putUChar((p + "_sm").c_str(), schedules[idx].startMin);
-  prefs.putUShort((p + "_du").c_str(), schedules[idx].durationSec);
-  prefs.putUChar((p + "_dm").c_str(), schedules[idx].daysMask);
-  prefs.end();
-}
-
-// --- توابع کمکی وب و API ---
-void sendJson(const String& body) {
-  web.sendHeader("Access-Control-Allow-Origin", "*");
-  web.send(200, "application/json", body);
-}
-
-String getSystemStatusJson() {
-  DateTime now = rtc.now();
-  String out = "{";
-  out += "\"uptime\":" + String(millis()) + ",";
-  out += "\"wifi\":{\"connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-  out += "\"ip\":\"" + (apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\",";
-  out += "\"apMode\":" + String(apMode ? "true" : "false") + "},";
-  out += "\"rtc\":{\"valid\":" + String(now.isValid() ? "true" : "false") + ",";
-  out += "\"time\":\"" + String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second()) + "\"},";
-  out += "\"pump\":" + String(pumpState ? "true" : "false") + ",";
-  out += "\"zones\":[";
-  for (int i = 0; i < 8; i++) {
-    if (i > 0) out += ",";
-    uint32_t rem = 0;
-    if (zoneStates[i] && zoneEndMillis[i] > millis()) {
-      rem = (zoneEndMillis[i] - millis()) / 1000;
-    }
-    out += "{\"id\":" + String(i + 1) + ",\"state\":" + String(zoneStates[i] ? "true" : "false") + ",\"rem\":" + String(rem) + "}";
-  }
-  out += "]}";
-  return out;
-}
-
-void registerRoutes() {
-  web.on("/health", HTTP_GET, []() {
-    sendJson("{\"status\":\"ok\",\"freeHeap\":" + String(ESP.getFreeHeap()) + "}");
-  });
-
-  web.on("/api/status", HTTP_GET, []() {
-    sendJson(getSystemStatusJson());
-  });
-
-  web.on("/api/zone", HTTP_GET, []() {
-    if (web.hasArg("id") && web.hasArg("state")) {
-      int id = web.arg("id").toInt() - 1;
-      bool state = web.arg("state") == "1" || web.arg("state") == "true";
-      int dur = web.hasArg("dur") ? web.arg("dur").toInt() : 0;
-      setZone(id, state, dur);
-      sendJson("{\"result\":\"success\"}");
-    } else {
-      web.send(400, "text/plain", "Bad Arguments");
-    }
-  });
-
-  web.on("/api/stop", HTTP_GET, []() {
-    stopAllZones();
-    sendJson("{\"result\":\"stopped_all\"}");
-  });
-
-  // مسیرهای ماژول Sync
-  web.on("/api/sync/now", HTTP_GET, []() {
-    syncTriggerNow();
-    sendJson(syncStatusJson());
-  });
-
-  web.on("/api/server/config", HTTP_GET, []() {
-    if (web.hasArg("url")) setServerUrl(web.arg("url"));
-    if (web.hasArg("en")) setServerEnabled(web.arg("en") == "1" || web.arg("en") == "true");
-    sendJson(syncStatusJson());
-  });
-}
-
-// --- CLI ترمینال سریال ---
-void handleSerialCLI() {
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd == "status") {
-      Serial.println(getSystemStatusJson());
-    } else if (cmd.startsWith("zone ")) {
-      int id = cmd.substring(5, 6).toInt() - 1;
-      int state = cmd.substring(7).toInt();
-      setZone(id, state == 1);
-      Serial.printf("Zone %d set to %d\n", id + 1, state);
-    } else if (cmd == "stop") {
-      stopAllZones();
-      Serial.println("All zones stopped.");
-    } else if (cmd == "sync") {
-      syncTriggerNow();
-      Serial.println("Sync triggered.");
-    }
-  }
-}
+WebApp webApp(rtc, wifi
+#ifdef MODULE_IRRIGATION
+  , irrigation
+#endif
+#ifdef MODULE_LIGHTING
+  , lighting
+#endif
+);
 
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
 
-  for (int i = 0; i < 8; i++) {
-    pinMode(RELAY_PINS[i], OUTPUT);
-    digitalWrite(RELAY_PINS[i], HIGH); // رله خاموش (Active LOW)
-  }
+  led.begin();
+  rtc.begin();
 
-  Wire.begin();
-  if (!rtc.begin()) {
-    Serial.println("RTC DS3231 not found!");
-  }
+#ifdef MODULE_IRRIGATION
+  irrigation.begin();
+#endif
 
-  loadSettings();
+#ifdef MODULE_LIGHTING
+  lighting.begin();
+#endif
 
-  // تلاش برای اتصال به شبکه خانگی
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();
-  
-  uint32_t startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 8000) {
-    delay(200);
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-  }
+  wifi.begin();
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Connected to Wi-Fi. IP: ");
-    Serial.println(WiFi.localIP());
-    apMode = false;
-  } else {
-    Serial.println("Wi-Fi STA failed. Starting AP mode fallback...");
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("SmartHome-ESP32", "12345678");
-    Serial.print("AP IP: ");
-    Serial.println(WiFi.softAPIP());
-    apMode = true;
-  }
-
-  // فعال‌سازی اتصال مجدد و بارگذاری ماژول Sync
-  WiFi.setAutoReconnect(true);
+  // Load sync config
   syncLoadConfig();
+  if (wifi.connected() && !wifi.isAccessPoint()) {
+    WiFi.setAutoReconnect(true);
+  }
 
-  registerRoutes();
-  web.begin();
-  Serial.println("Web server started.");
-  blinkLed(3);
+  webApp.begin();
+
+  Serial.println("=== Smart Greenhouse Controller ===");
+  Serial.printf("IP: %s\n", wifi.ip().c_str());
+  Serial.printf("Network: %s\n", wifi.network().c_str());
+  Serial.println("Ready. Type HELP for CLI commands.");
+}
+
+// --- CLI ---
+void handleCLI() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  String u = cmd;
+  u.toUpperCase();
+
+  if (u == "HELP") {
+    Serial.println("ADD <id> <gpio> | SET <id> <HH:MM> <min> | ENABLE <id> | DISABLE <id>");
+    Serial.println("ON <id> <min> | OFF <id> | PUMP ON/OFF/STATUS | RELAY TEST | STATUS | SYNC");
+    return;
+  }
+
+  if (u == "STATUS") {
+    Serial.printf("Time: %04d-%02d-%02d %02d:%02d:%02d\n",
+      rtc.now().year(), rtc.now().month(), rtc.now().day(),
+      rtc.now().hour(), rtc.now().minute(), rtc.now().second());
+#ifdef MODULE_IRRIGATION
+    Serial.printf("Zones: %u | Pump: %s | Pending events: %u\n",
+      irrigation.zoneCount(), irrigation.pumpIsOn() ? "ON" : "OFF", pendingCount());
+#endif
+    return;
+  }
+
+#ifdef MODULE_IRRIGATION
+  if (u == "RELAY TEST") {
+    Serial.println("Relay Test: GPIO25 (pump) ON 3s");
+    irrigation.setPump(true, "relay test");
+    delay(3000);
+    irrigation.setPump(false, "relay test done");
+    Serial.println("Relay Test: GPIO26 (zone 1) ON 3s");
+    // Find zone 1 and start briefly
+    int zi = irrigation.findZone(1);
+    if (zi >= 0) { irrigation.start(zi, 1, "relay test"); delay(3000); irrigation.stop(zi, "relay test done"); }
+    Serial.println("Relay Test: complete");
+    return;
+  }
+
+  if (u == "PUMP ON") {
+    irrigation.clearPumpOverride();
+    irrigation.setPump(true, "CLI manual start");
+    return;
+  }
+  if (u == "PUMP OFF") {
+    irrigation.clearPumpOverride();
+    for (uint8_t i = 0; i < irrigation.zoneCount(); i++)
+      irrigation.stop(i, "Pump stop");
+    irrigation.setPump(false, "CLI manual stop");
+    return;
+  }
+  if (u == "PUMP STATUS") {
+    Serial.printf("Pump: %s | GPIO %d\n",
+      irrigation.pumpIsOn() ? "ON" : "OFF",
+      IrrigationService::RELAY_PINS[IrrigationService::PUMP_RELAY_CHANNEL]);
+    return;
+  }
+
+  int a, b;
+  char tm[6];
+  if (sscanf(u.c_str(), "ADD %d %d", &a, &b) == 2) {
+    if (irrigation.addZone(a, (uint8_t)b))
+      Serial.printf("Zone %d added on GPIO %d\n", a, b);
+    else
+      Serial.printf("ERROR: ADD rejected (duplicate/full/reserved GPIO %d)\n", b);
+    return;
+  }
+  if (sscanf(u.c_str(), "ON %d %d", &a, &b) == 2) {
+    int zi = irrigation.findZone(a);
+    if (irrigation.start(zi, b, "MANUAL"))
+      Serial.printf("Zone %d ON for %d min\n", a, b);
+    else
+      Serial.println("ERROR: Zone not found or invalid duration");
+    return;
+  }
+  if (sscanf(u.c_str(), "OFF %d", &a) == 1) {
+    int zi = irrigation.findZone(a);
+    if (irrigation.stop(zi, "Manual stop"))
+      Serial.printf("Zone %d OFF\n", a);
+    else
+      Serial.println("ERROR: Zone not found");
+    return;
+  }
+  if (sscanf(u.c_str(), "ENABLE %d", &a) == 1) {
+    irrigation.enableZone(irrigation.findZone(a));
+    return;
+  }
+  if (sscanf(u.c_str(), "DISABLE %d", &a) == 1) {
+    irrigation.disableZone(irrigation.findZone(a));
+    return;
+  }
+  if (sscanf(u.c_str(), "SET %d %5s %d", &a, tm, &b) == 3) {
+    int hh, mm;
+    int zi = irrigation.findZone(a);
+    if (zi >= 0 && sscanf(tm, "%d:%d", &hh, &mm) == 2) {
+      if (irrigation.setSchedule(zi, hh, mm, b))
+        Serial.printf("Schedule set: Zone %d at %02d:%02d for %d min\n", a, hh, mm, b);
+    }
+    return;
+  }
+#endif
+
+#ifdef MODULE_LIGHTING
+  if (sscanf(u.c_str(), "LIGHT %d %d", &a, &b) == 2) {
+    lighting.setChannel(a, b != 0);
+    Serial.printf("Lighting channel %d: %s\n", a, b ? "ON" : "OFF");
+    return;
+  }
+  if (u == "LIGHT ALL ON") { lighting.allOn(); return; }
+  if (u == "LIGHT ALL OFF") { lighting.allOff(); return; }
+#endif
+
+  if (u == "SYNC") {
+    syncTriggerNow();
+    Serial.println("Sync triggered.");
+    return;
+  }
 }
 
 void loop() {
-  // ۱. بررسی اتصال مجدد شبکه (Non-blocking)
-  static uint32_t lastReconnect = 0;
-  if (!apMode && WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastReconnect >= 30000) {
-      lastReconnect = millis();
-      WiFi.reconnect();
-    }
-  }
+  uint32_t now = millis();
 
-  // ۲. مدیریت همگام‌سازی سرور
+  wifi.update();
+  led.update();
+
+#ifdef MODULE_IRRIGATION
+  irrigation.update(now);
+#endif
+
+#ifdef MODULE_LIGHTING
+  lighting.update(now);
+#endif
+
+  webApp.update();
   syncLoop();
 
-  // ۳. رسیدگی به کلاینت‌های وب و کنسول CLI
-  web.handleClient();
-  handleSerialCLI();
-
-  // ۴. بررسی تایمر خاموشی خودکار زون‌ها
-  uint32_t now = millis();
-  for (int i = 0; i < 8; i++) {
-    if (zoneStates[i] && zoneEndMillis[i] > 0 && now >= zoneEndMillis[i]) {
-      setZone(i, false);
-    }
-  }
+  handleCLI();
+  delay(2);
 }
