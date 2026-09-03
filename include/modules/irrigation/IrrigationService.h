@@ -61,7 +61,7 @@ public:
   static const uint8_t DEFAULT_PINS[ZONE_COUNT];
 
   // Relay pin mapping (active channels) — matched to your running board
-  static constexpr int8_t RELAY_PINS[8] = {25, 26, 27, 14, 12, 13, 15, 4};
+  static constexpr int8_t RELAY_PINS[8] = {25, 26, -1, -1, -1, -1, -1, -1};  // 2-ch relay board: ch0=pump(GPIO25), ch1=zone1(GPIO26), rest=direct GPIO
   static constexpr uint8_t PUMP_RELAY_CHANNEL = 0; // Relay 1 / IN1 → GPIO25
   static constexpr uint8_t ZONE1_RELAY_CHANNEL = 1; // Relay 2 / IN2 → GPIO26
 

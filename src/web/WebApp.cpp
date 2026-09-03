@@ -143,6 +143,7 @@ void WebApp::handleZoneSchedule(AsyncWebServerRequest* request) {
 
   int idx = irrigation.findZone(idVal);
   if (idx >= 0 && irrigation.setSchedule(idx, (uint8_t)hVal, (uint8_t)mVal, (uint16_t)dVal)) {
+    queueEvent("schedule", "set");
     Serial.printf("SCHEDULE OK: zone %d set to %02d:%02d for %d min\n", idVal, hVal, mVal, dVal);
     sendJson(request, "{\"ok\":true}");
   } else {
@@ -311,6 +312,9 @@ function $(id){return document.getElementById(id)}
 function isFocusedInside(id){
   var ae=document.activeElement;
   if(!ae)return false;
+  // Only block refresh when editing text/select — not for buttons
+  var t=ae.tagName;
+  if(t!='INPUT'&&t!='TEXTAREA'&&t!='SELECT')return false;
   var c=$(id);
   if(!c)return false;
   while(ae){if(ae===c)return true;ae=ae.parentElement}
@@ -475,14 +479,18 @@ function renderSettings(){
 
 // --- Actions (no page refresh) ---
 function setSchedule(id){
-  const t=document.getElementById('sch-t'+id).value;
-  const d=document.getElementById('sch-d'+id).value;
+  var tEl=document.getElementById('sch-t'+id);
+  var dEl=document.getElementById('sch-d'+id);
+  var t=tEl.value;
+  var d=dEl.value;
   if(!t||!d){alert('Set time and duration first');return;}
+  // Blur any active input so focus guard won't block next refresh
+  if(document.activeElement)document.activeElement.blur();
   const [h,m]=t.split(':');
   var url='/api/zone/schedule?id='+id+'&hour='+h+'&minute='+m+'&dur='+d;
-  fetch(url,{method:'POST'}).then(r=>r.json()).then(function(j){
-    if(j.ok)refresh();
-    else alert('Failed: check Serial monitor for debug');
+  fetch(url,{method:'POST'}).then(function(r){return r.json()}).then(function(j){
+    if(j.ok){refresh();}
+    else {alert('Failed');}
   });
 }
 function saveWifi(){
