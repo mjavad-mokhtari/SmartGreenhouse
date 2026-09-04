@@ -319,6 +319,36 @@ app.post('/recover-2fa', (req, res) => {
 
 app.get('/logout', (req, res) => { req.session.destroy(); res.redirect('/login'); });
 
+// Emergency QR recovery (only when single user exists - no password needed)
+app.get('/emergency-qr', async (req, res) => {
+  if (users.length !== 1 || !users[0].totpSecret || !otplib) {
+    return res.type('html').send('<h2>Emergency QR unavailable</h2><a href="/login">Go to login</a>');
+  }
+  const user = users[0];
+  try {
+    const otpauth = otplib.authenticator.keyuri(user.username, 'SmartGreenHome', user.totpSecret);
+    const qrDataUrl = await QRCode.toDataURL(otpauth, { width: 250 });
+    res.type('html').send(setupDonePage(qrDataUrl, user.totpSecret));
+  } catch(e) {
+    res.type('html').send('<h2>QR Error</h2><p>' + e.message + '</p>');
+  }
+});
+
+// Emergency password reset (only when single user exists)
+app.get('/emergency-reset', (req, res) => {
+  if (users.length !== 1) return res.redirect('/login');
+  res.type('html').send(resetPage());
+});
+
+app.post('/emergency-reset', (req, res) => {
+  if (users.length !== 1) return res.redirect('/login');
+  const { password } = req.body;
+  if (!password || password.length < 4) return res.type('html').send(resetPage('رمز عبور حداقل ۴ کاراکتر'));
+  users[0].passwordHash = hashPassword(password);
+  saveUsers();
+  res.type('html').send('<h2>✅ رمز عبور با موفقیت تغییر کرد</h2><p><a href="/login">رفتن به صفحه ورود</a></p>');
+});
+
 // =========== DASHBOARD (after auth) ===========
 app.get('/', requireAuth, (req, res) => {
   res.type('html').send(dashboardPage());
@@ -360,6 +390,20 @@ function recoverPage(error) {
 <form method="POST"><input class="inp" name="username" placeholder="نام کاربری" required><input class="inp" type="password" name="password" placeholder="رمز عبور" required><button class="btn" type="submit">دریافت QR کد</button></form><div style="text-align:center;margin-top:12px"><a href="/login" style="color:var(--sub);font-size:12px">بازگشت به صفحه ورود</a></div></div></body></html>`;
 }
 
+function resetPage(error) {
+  const err = error ? `<div style="background:rgba(239,68,68,.15);color:#ef4444;padding:10px;border-radius:8px;margin-bottom:16px;font-size:13px">${error}</div>` : '';
+  return `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ریست رمز | خانه سبز هوشمند</title>
+<style>:root{--bg:#0f172a;--card:#1e293b;--accent:#10b981;--text:#f1f5f9;--sub:#94a3b8;--radius:14px}
+*{margin:0;padding:0;box-sizing:border-box}body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.box{background:var(--card);border-radius:var(--radius);padding:28px 22px;width:100%;max-width:380px}
+.box h2{text-align:center;margin-bottom:6px;font-size:20px}.box .sub{text-align:center;color:var(--sub);font-size:12px;margin-bottom:20px}
+.inp{width:100%;padding:12px;margin-bottom:10px;background:#0f172a;border:1px solid rgba(255,255,255,.1);border-radius:10px;color:var(--text);font-size:14px;outline:none}
+.inp:focus{border-color:var(--accent)}
+.btn{width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;margin-top:6px}
+</style></head><body><div class="box"><h2>🔑 ریست رمز عبور</h2><div class="sub">رمز عبور جدید تنظیم کنید</div>${err}
+<form method="POST"><input class="inp" type="password" name="password" placeholder="رمز عبور جدید (حداقل ۴ کاراکتر)" required minlength="4"><button class="btn" type="submit">تنظیم رمز جدید</button></form></div></body></html>`;
+}
+
 function loginPage(error) {
   const err = error ? `<div style="background:rgba(239,68,68,.15);color:#ef4444;padding:10px;border-radius:8px;margin-bottom:16px;font-size:13px">${error}</div>` : '';
   return `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ورود | خانه سبز هوشمند</title>
@@ -372,7 +416,7 @@ function loginPage(error) {
 .btn{width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;margin-top:6px}
 .btn:hover{opacity:.9}
 </style></head><body><div class="box"><h2>🏠 خانه سبز هوشمند</h2><div class="sub">ورود به داشبورد</div>${err}
-<form method="POST"><input class="inp" name="username" placeholder="نام کاربری" required><input class="inp" type="password" name="password" placeholder="رمز عبور" required><input class="inp" name="totp" placeholder="کد ۶ رقمی Google Authenticator" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"><button class="btn" type="submit">ورود</button></form><div style="text-align:center;margin-top:12px"><a href="/recover-2fa" style="color:var(--sub);font-size:11px">بازیابی کد QR ▸</a></div></div></body></html>`;
+<form method="POST"><input class="inp" name="username" placeholder="نام کاربری" required><input class="inp" type="password" name="password" placeholder="رمز عبور" required><input class="inp" name="totp" placeholder="کد ۶ رقمی Google Authenticator" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"><button class="btn" type="submit">ورود</button></form><div style="text-align:center;margin-top:12px"><a href="/recover-2fa" style="color:var(--sub);font-size:11px">بازیابی کد QR ▸</a> &nbsp;|&nbsp; <a href="/emergency-reset" style="color:var(--sub);font-size:11px">ریست رمز عبور</a></div></div></body></html>`;
 }
 
 function setupPage(error) {
