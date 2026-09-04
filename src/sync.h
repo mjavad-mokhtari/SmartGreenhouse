@@ -14,7 +14,7 @@ struct SyncEvent {
   uint32_t ts;
 };
 
-static const size_t SYNC_RING_SIZE = 32;
+static const size_t SYNC_RING_SIZE = 50;
 inline SyncEvent _syncEvents[SYNC_RING_SIZE];
 inline size_t _syncHead = 0;
 inline size_t _syncCount = 0;
@@ -28,6 +28,7 @@ inline uint32_t _syncLastAttempt = 0;
 inline uint32_t _syncBackoffMs = 30000;
 static const uint32_t SYNC_MAX_BACKOFF_MS = 900000; // 15 min
 inline bool _syncForceNow = false;
+inline String _deviceId = "esp32-irrigation";
 
 // Remote command polling
 
@@ -89,6 +90,21 @@ inline String apiKeySummary() {
 inline bool serverOnlineFlag() { return _serverOnline; }
 inline size_t pendingCount() { return _syncCount; }
 
+inline String getDeviceId() { return _deviceId; }
+
+inline void setDeviceId(const String& id) {
+  if (id.length() > 0) _deviceId = id;
+  _syncPrefs.begin("sync", false);
+  _syncPrefs.putString("dev_id", _deviceId);
+  _syncPrefs.end();
+}
+
+inline void syncLoadDeviceId() {
+  _syncPrefs.begin("sync", false);
+  _deviceId = _syncPrefs.getString("dev_id", "esp32-irrigation");
+  _syncPrefs.end();
+}
+
 inline void queueEvent(const String& type, const String& state) {
   size_t idx = (_syncHead + _syncCount) % SYNC_RING_SIZE;
   if (_syncCount == SYNC_RING_SIZE) {
@@ -145,7 +161,7 @@ inline bool pollServerCommands(String& outJson, uint32_t timeoutMs = 2500) {
   HTTPClient http;
   String commandUrl = _srvUrl;
   if (!commandUrl.endsWith("/")) commandUrl += "/";
-  commandUrl += "api/commands?device=esp32-smarthome";
+  commandUrl += "api/commands?device=" + _deviceId;
 
   http.begin(commandUrl);
   String key = getApiKey();
@@ -181,7 +197,7 @@ inline bool ackServerCommands(const String& idsJsonArray) {
     http.addHeader("X-API-Key", key);
   }
   http.addHeader("Content-Type", "application/json");
-  String payload = "{\"deviceId\":\"esp32-smarthome\",\"ids\":" + idsJsonArray + "}";
+  String payload = "{\"deviceId\":\"" + _deviceId + "\",\"ids\":" + idsJsonArray + "}";
   int code = http.POST(payload);
   http.end();
   return (code >= 200 && code < 300);
@@ -211,7 +227,7 @@ inline void syncLoop(const String& statusJson = String()) {
     if (key.length() > 0) http.addHeader("X-API-Key", key);
 
     String payload = "{";
-    payload += "\"deviceId\":\"esp32-smarthome\",";
+    payload += "\"deviceId\":\"" + _deviceId + "\",";
     payload += "\"serverTime\":" + String(millis()) + ",";
     payload += "\"uptime\":" + String(millis()) + ",";
     payload += "\"pending\":" + String(_syncCount) + ",";

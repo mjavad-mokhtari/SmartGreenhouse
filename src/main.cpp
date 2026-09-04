@@ -76,6 +76,7 @@ void setup() {
 
   // Load sync config
   syncLoadConfig();
+  syncLoadDeviceId();
   if (wifi.connected() && !wifi.isAccessPoint()) {
     WiFi.setAutoReconnect(true);
   }
