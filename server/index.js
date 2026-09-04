@@ -1,66 +1,70 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
+const path = require('path');
 
 // --------------- Config ---------------
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'gh-greenhouse-2025-secure-key-change-me';
-const devices = new Map(); // deviceId -> last seen info
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const EVENTS_FILE = path.join(DATA_DIR, 'events.json');
+const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
+const MAX_EVENTS = 10000;
 
-// --------------- SQLite setup ---------------
-let db;
-try {
-  const Database = require('better-sqlite3');
-  db = new Database('greenhouse.db');
-  db.pragma('journal_mode = WAL');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      device_id TEXT NOT NULL,
-      event_type TEXT NOT NULL,
-      state TEXT NOT NULL,
-      ts INTEGER NOT NULL,
-      received_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000)
-    );
-    CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id);
-    CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
-    CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
-    
-    CREATE TABLE IF NOT EXISTS device_state (
-      device_id TEXT PRIMARY KEY,
-      state_json TEXT NOT NULL DEFAULT '{}',
-      last_seen INTEGER NOT NULL DEFAULT 0,
-      ip TEXT,
-      uptime INTEGER DEFAULT 0
-    );
-  `);
-  console.log('[DB] SQLite ready');
-} catch(e) {
-  console.error('[DB] better-sqlite3 not available, falling back to memory store:', e.message);
-  // In-memory fallback
-  const memEvents = [];
-  db = {
-    memory: true,
-    events: [],
-    addEvent(deviceId, type, state, ts) {
-      const e = { id: memEvents.length+1, device_id: deviceId, event_type: type, state, ts, received_at: Date.now() };
-      memEvents.push(e);
-      if (memEvents.length > 10000) memEvents.shift();
-      return e;
-    },
-    getEvents(deviceId, limit=100) {
-      return memEvents.filter(e => e.device_id === deviceId || !deviceId).slice(-limit);
-    }
-  };
+// --------------- File-Based Store ---------------
+let events = [];
+let deviceStates = {};
+let stats = { totalEvents: 0, todayEvents: 0 };
+
+function initStore() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  try { events = JSON.parse(fs.readFileSync(EVENTS_FILE, 'utf8') || '[]'); } catch(e) { events = []; }
+  try { deviceStates = JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8') || '{}'); } catch(e) { deviceStates = {}; }
+  stats.totalEvents = events.length;
+  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+  stats.todayEvents = events.filter(e => e.received_at >= todayStart.getTime()).length;
 }
+
+function saveEvents() {
+  if (events.length > MAX_EVENTS) events = events.slice(-MAX_EVENTS);
+  fs.writeFileSync(EVENTS_FILE, JSON.stringify(events), 'utf8');
+}
+
+function saveDevices() {
+  fs.writeFileSync(DEVICES_FILE, JSON.stringify(deviceStates), 'utf8');
+}
+
+function addEvent(deviceId, type, state, ts) {
+  const e = {
+    id: events.length + 1,
+    device_id: deviceId,
+    event_type: type,
+    state,
+    ts: ts || Date.now(),
+    received_at: Date.now()
+  };
+  events.push(e);
+  if (events.length > MAX_EVENTS) events = events.slice(-MAX_EVENTS);
+  stats.totalEvents++;
+  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+  if (e.received_at >= todayStart.getTime()) stats.todayEvents++;
+  // Save every 10 events
+  if (events.length % 10 === 0) saveEvents();
+  return e;
+}
+
+initStore();
+console.log(`[Store] ${events.length} events loaded from file`);
+
+// Active device tracking (in-memory)
+const activeDevices = new Map(); // deviceId -> { lastSeen, uptime, ip, status }
 
 // --------------- Express + HTTP ---------------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// CORS for ESP32 + browser
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
@@ -69,117 +73,97 @@ app.use((req, res, next) => {
   next();
 });
 
-// API Key middleware
 function requireApiKey(req, res, next) {
   const key = req.headers['x-api-key'] || req.query.api_key;
   if (key !== API_KEY) return res.status(401).json({ error: 'invalid API key' });
   next();
 }
 
-// --------------- Static Dashboard ---------------
+// --------------- Routes ---------------
+
+// Dashboard
 app.get('/', (req, res) => {
   res.type('html').send(generateDashboard());
 });
 
-// Health check
+// Health
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     uptime: process.uptime(),
     memory: process.memoryUsage(),
-    devices: devices.size,
+    devices: activeDevices.size,
     nodejs: process.version
   });
 });
 
-// --------------- Device Events (from ESP32) ---------------
+// Receive events from ESP32
 app.post('/api/events', (req, res) => {
-  const { deviceId, uptime, events, status: deviceStatus } = req.body;
+  const { deviceId, uptime, events: evts, status: deviceStatus } = req.body;
   if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
-  // Update device state
-  const deviceInfo = {
+  activeDevices.set(deviceId, {
     lastSeen: Date.now(),
     uptime: uptime || 0,
     ip: req.ip || req.connection.remoteAddress,
     status: deviceStatus || {}
+  });
+  deviceStates[deviceId] = {
+    lastSeen: Date.now(),
+    uptime: uptime || 0,
+    ip: req.ip,
+    status: deviceStatus || {}
   };
-  devices.set(deviceId, deviceInfo);
+  saveDevices();
 
-  // Store in DB
-  try {
-    if (db.memory) {
-      if (events) events.forEach(e => db.addEvent(deviceId, e.type, e.state, e.ts));
-    } else {
-      if (events && events.length > 0) {
-        const insert = db.prepare('INSERT INTO events (device_id, event_type, state, ts) VALUES (?, ?, ?, ?)');
-        const upsertState = db.prepare(`INSERT OR REPLACE INTO device_state (device_id, state_json, last_seen, ip, uptime) VALUES (?, ?, ?, ?, ?)`);
-        
-        const tx = db.transaction(() => {
-          for (const e of events) {
-            insert.run(deviceId, e.type, e.state, e.ts || Date.now());
-          }
-          upsertState.run(deviceId, JSON.stringify(deviceStatus || {}), Date.now(), req.ip, uptime || 0);
-        });
-        tx();
-      }
+  let received = 0;
+  if (evts && evts.length > 0) {
+    for (const e of evts) {
+      addEvent(deviceId, e.type, e.state, e.ts);
+      received++;
     }
-  } catch(e) { console.error('[DB] Error storing events:', e.message); }
-
-  // Broadcast to WebSocket clients
-  if (events && events.length > 0) {
-    const msg = JSON.stringify({ type: 'events', deviceId, events: events.slice(-10) });
-    wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
   }
 
-  // Broadcast device status update
+  // Broadcast to WebSocket
+  if (evts && evts.length > 0) {
+    broadcast({ type: 'events', deviceId, events: evts.slice(-10) });
+  }
   broadcastDeviceStatus();
 
-  res.json({ ok: true, received: events ? events.length : 0 });
+  res.json({ ok: true, received });
 });
 
-// --------------- API: Get events ---------------
+// Get events
 app.get('/api/events', (req, res) => {
   const deviceId = req.query.device;
   const limit = parseInt(req.query.limit) || 100;
   const since = parseInt(req.query.since) || 0;
 
-  try {
-    if (db.memory) {
-      res.json({ events: db.getEvents(deviceId, limit) });
-    } else {
-      let query, params;
-      if (deviceId) {
-        query = 'SELECT * FROM events WHERE device_id = ? AND ts > ? ORDER BY id DESC LIMIT ?';
-        params = [deviceId, since, limit];
-      } else {
-        query = 'SELECT * FROM events WHERE ts > ? ORDER BY id DESC LIMIT ?';
-        params = [since, limit];
-      }
-      res.json({ events: db.prepare(query).all(...params).reverse() });
-    }
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  let filtered = deviceId
+    ? events.filter(e => e.device_id === deviceId)
+    : events;
+  if (since > 0) filtered = filtered.filter(e => e.ts > since);
+  res.json({ events: filtered.slice(-limit) });
 });
 
-// --------------- API: Get devices status ---------------
+// Get devices
 app.get('/api/devices', (req, res) => {
   const list = [];
-  devices.forEach((info, id) => {
+  activeDevices.forEach((info, id) => {
     list.push({
       deviceId: id,
       lastSeen: info.lastSeen,
       uptime: info.uptime,
-      online: (Date.now() - info.lastSeen) < 120000 // 2 min timeout
+      online: (Date.now() - info.lastSeen) < 120000
     });
   });
   res.json({ devices: list, count: list.length });
 });
 
-// --------------- API: Remote Control (for future) ---------------
+// Remote control (future)
 app.post('/api/control', requireApiKey, (req, res) => {
   const { deviceId, command } = req.body;
   if (!deviceId || !command) return res.status(400).json({ error: 'deviceId + command required' });
-  // Forward command via WebSocket if client is connected
   let sent = false;
   wss.clients.forEach(c => {
     if (c.deviceId === deviceId && c.readyState === WebSocket.OPEN) {
@@ -187,70 +171,41 @@ app.post('/api/control', requireApiKey, (req, res) => {
       sent = true;
     }
   });
-  res.json({ ok: sent, note: sent ? 'command forwarded' : 'device not connected via WebSocket' });
+  res.json({ ok: sent, note: sent ? 'forwarded' : 'device not connected' });
 });
 
-// --------------- System Stats ---------------
+// Stats
 app.get('/api/stats', (req, res) => {
-  try {
-    if (db.memory) {
-      res.json({ totalEvents: db.events.length, devices: devices.size });
-    } else {
-      const totalEvents = db.prepare('SELECT COUNT(*) as c FROM events').get().c;
-      const todayEvents = db.prepare("SELECT COUNT(*) as c FROM events WHERE received_at > strftime('%s','now','start of day')*1000").get().c;
-      const topTypes = db.prepare('SELECT event_type, COUNT(*) as c FROM events GROUP BY event_type ORDER BY c DESC LIMIT 10').all();
-      res.json({ totalEvents, todayEvents, devices: devices.size, topTypes });
-    }
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  res.json({
+    totalEvents: stats.totalEvents,
+    todayEvents: stats.todayEvents,
+    devices: activeDevices.size
+  });
 });
 
-// --------------- API: Delete old events ---------------
+// Delete old events
 app.delete('/api/events', requireApiKey, (req, res) => {
   const days = parseInt(req.query.older_than) || 30;
-  try {
-    if (!db.memory) {
-      const cutoff = Date.now() - (days * 86400000);
-      const result = db.prepare('DELETE FROM events WHERE ts < ?').run(cutoff);
-      res.json({ ok: true, deleted: result.changes });
-    } else { res.json({ ok: true, deleted: 0, note: 'memory mode' }); }
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  const cutoff = Date.now() - (days * 86400000);
+  const before = events.length;
+  events = events.filter(e => e.received_at >= cutoff);
+  stats.totalEvents = events.length;
+  saveEvents();
+  res.json({ ok: true, deleted: before - events.length });
 });
 
 // --------------- HTTP Server + WebSocket ---------------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
-wss.on('connection', (ws, req) => {
-  const deviceId = req.url.includes('device=') 
-    ? new URL(req.url, 'http://localhost').searchParams.get('device') 
-    : 'browser';
-  ws.deviceId = deviceId;
-  console.log(`[WS] connected: ${deviceId} (total: ${wss.clients.size})`);
-
-  ws.send(JSON.stringify({ type: 'connected', serverTime: Date.now(), clientCount: wss.clients.size }));
-
-  // Send current device list
-  broadcastDeviceStatus();
-
-  ws.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data);
-      if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
-      if (msg.type === 'command_response') {
-        console.log(`[CMD] Response from ${deviceId}:`, msg);
-      }
-    } catch(e) {}
-  });
-
-  ws.on('close', () => {
-    console.log(`[WS] disconnected: ${deviceId} (total: ${wss.clients.size})`);
-    broadcastDeviceStatus();
-  });
-});
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(data); });
+}
 
 function broadcastDeviceStatus() {
   const list = [];
-  devices.forEach((info, id) => {
+  activeDevices.forEach((info, id) => {
     list.push({
       deviceId: id,
       lastSeen: info.lastSeen,
@@ -265,218 +220,110 @@ function broadcastDeviceStatus() {
   });
 }
 
-// --------------- Dashboard HTML ---------------
+wss.on('connection', (ws, req) => {
+  const params = new URLSearchParams(req.url.split('?')[1] || '');
+  const deviceId = params.get('device') || 'browser';
+  ws.deviceId = deviceId;
+  console.log(`[WS] + ${deviceId} (${wss.clients.size} clients)`);
+  ws.send(JSON.stringify({ type: 'connected', serverTime: Date.now(), clients: wss.clients.size }));
+  broadcastDeviceStatus();
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data);
+      if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+    } catch(e) {}
+  });
+
+  ws.on('close', () => {
+    console.log(`[WS] - ${deviceId} (${wss.clients.size} clients)`);
+    broadcastDeviceStatus();
+  });
+});
+
+// --------------- Dashboard HTML (Persian, RTL, Mobile-first) ---------------
 function generateDashboard() {
   return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>گلخانه هوشمند</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>> گلخانه هوشمند</title>
 <style>
-:root {
-  --bg: #0f172a; --card: #1e293b; --accent: #10b981; --accent2: #3b82f6;
-  --danger: #ef4444; --warn: #f59e0b; --text: #f1f5f9; --sub: #94a3b8;
-  --radius: 16px; --gap: 12px;
-}
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; min-height: 100vh; padding-bottom: 20px; }
-.container { max-width: 600px; margin: 0 auto; padding: 12px; }
-/* Header */
-.header { background: linear-gradient(135deg, #0f766e, #10b981); border-radius: var(--radius); padding: 20px 16px; margin-bottom: var(--gap); position: relative; overflow: hidden; }
-.header::after { content:''; position:absolute; top:-40px; right:-40px; width:120px; height:120px; background:rgba(255,255,255,0.06); border-radius:50%; }
-.header h1 { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
-.header .sub { font-size: 13px; opacity: 0.85; }
-.header .status-dot { display:inline-block; width:8px; height:8px; background:#fff; border-radius:50%; margin-left:6px; animation: pulse 2s infinite; }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-
-/* Stats row */
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: var(--gap); }
-.stat-card { background: var(--card); border-radius: 12px; padding: 14px 10px; text-align: center; }
-.stat-card .val { font-size: 24px; font-weight: 700; margin-bottom: 2px; }
-.stat-card .lbl { font-size: 11px; color: var(--sub); }
-.stat-card.online .val { color: var(--accent); }
-.stat-card.events .val { color: var(--accent2); }
-.stat-card.uptime .val { color: var(--warn); }
-
-/* Info cards */
-.info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: var(--gap); }
-.info-card { background: var(--card); border-radius: 12px; padding: 14px; }
-.info-card .label { font-size: 11px; color: var(--sub); margin-bottom: 4px; }
-.info-card .value { font-size: 16px; font-weight: 600; }
-.info-card .value.online { color: var(--accent); }
-.info-card .value.offline { color: var(--danger); }
-
-/* Section */
-.section { margin-bottom: var(--gap); }
-.section-title { font-size: 15px; font-weight: 600; margin-bottom: 8px; display:flex; align-items:center; gap:6px; }
-.section-title::before { content:''; width:4px; height:18px; background:var(--accent); border-radius:2px; }
-
-/* Log / Event list */
-.log-list { background: var(--card); border-radius: var(--radius); overflow: hidden; }
-.log-item { padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-.log-item:last-child { border-bottom: none; }
-.log-item .evt-type { font-size: 13px; font-weight: 500; }
-.log-item .evt-state { font-size: 12px; color: var(--sub); padding: 3px 8px; background: rgba(255,255,255,0.06); border-radius: 6px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.log-item .evt-time { font-size: 11px; color: var(--sub); white-space: nowrap; }
-.log-empty { padding: 24px; text-align: center; color: var(--sub); font-size: 13px; }
-
-/* Device list */
-.device-card { background: var(--card); border-radius: 12px; padding: 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
-.device-card .dev-id { font-weight: 600; font-size: 14px; }
-.device-card .dev-info { font-size: 12px; color: var(--sub); }
-.device-card .dev-status { font-size: 12px; padding: 4px 12px; border-radius: 20px; font-weight: 500; }
-.device-card .dev-status.online { background: rgba(16,185,129,0.15); color: var(--accent); }
-.device-card .dev-status.offline { background: rgba(239,68,68,0.15); color: var(--danger); }
-
-/* Refresh indicator */
-.refresh-bar { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; margin-bottom: var(--gap); }
-.refresh-bar .last-update { font-size: 11px; color: var(--sub); }
-.refresh-bar button { background: var(--card); color: var(--text); border: 1px solid rgba(255,255,255,0.1); padding: 6px 14px; border-radius: 8px; font-size: 12px; cursor: pointer; }
-
-/* Responsive */
-@media (max-width: 380px) {
-  .stats { grid-template-columns: repeat(3,1fr); gap: 6px; }
-  .info-grid { grid-template-columns: 1fr; }
-}
+:root{--bg:#0f172a;--card:#1e293b;--accent:#10b981;--blue:#3b82f6;--danger:#ef4444;--warn:#f59e0b;--text:#f1f5f9;--sub:#94a3b8;--radius:14px;--gap:10px}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;padding-bottom:30px;font-size:14px}
+.container{max-width:560px;margin:0 auto;padding:10px}
+.header{background:linear-gradient(135deg,#0f766e,#10b981);border-radius:var(--radius);padding:18px 14px;margin-bottom:var(--gap);display:flex;justify-content:space-between;align-items:center}
+.header h1{font-size:18px;font-weight:700}
+.header .badge{font-size:11px;background:rgba(255,255,255,.2);padding:4px 10px;border-radius:20px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:var(--gap)}
+.stat{background:var(--card);border-radius:12px;padding:14px 10px;text-align:center}
+.stat .v{font-size:22px;font-weight:700;margin-bottom:2px}
+.stat .l{font-size:10px;color:var(--sub)}
+.stat.g .v{color:var(--accent)}.stat.b .v{color:var(--blue)}.stat.y .v{color:var(--warn)}
+.section{margin-bottom:var(--gap)}
+.stitle{font-size:14px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.stitle::before{content:'';width:3px;height:16px;background:var(--accent);border-radius:2px}
+.card{background:var(--card);border-radius:var(--radius);overflow:hidden}
+.row{padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.04);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.row:last-child{border-bottom:none}
+.row .t{font-size:13px;font-weight:500}
+.row .s{font-size:11px;color:var(--sub);padding:3px 8px;background:rgba(255,255,255,.05);border-radius:6px;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .tm{font-size:11px;color:var(--sub);white-space:nowrap}
+.empty{padding:24px;text-align:center;color:var(--sub);font-size:13px}
+.dev-row{padding:12px 14px;display:flex;justify-content:space-between;align-items:center}
+.dev-row .n{font-weight:600;font-size:13px}
+.dev-row .i{font-size:11px;color:var(--sub)}
+.dev-dot{font-size:11px;padding:4px 12px;border-radius:20px;font-weight:500}
+.dev-dot.on{background:rgba(16,185,129,.15);color:var(--accent)}
+.dev-dot.off{background:rgba(239,68,68,.15);color:var(--danger)}
+.bar{display:flex;justify-content:space-between;align-items:center;padding:6px 0;margin-bottom:var(--gap)}
+.bar .lu{font-size:10px;color:var(--sub)}
+.bar button{background:var(--card);color:var(--text);border:1px solid rgba(255,255,255,.1);padding:5px 12px;border-radius:8px;font-size:11px;cursor:pointer}
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="header">
-    <h1>🌱 گلخانه هوشمند</h1>
-    <div class="sub"><span class="status-dot"></span> <span id="connStatus">در حال اتصال...</span></div>
-  </div>
-
-  <div class="refresh-bar">
-    <span class="last-update" id="lastUpdate">--</span>
-    <button onclick="refreshAll()">🔄 به‌روزرسانی</button>
-  </div>
-
-  <div class="stats">
-    <div class="stat-card online"><div class="val" id="statDevices">0</div><div class="lbl">دستگاه فعال</div></div>
-    <div class="stat-card events"><div class="val" id="statEvents">0</div><div class="lbl">رویداد امروز</div></div>
-    <div class="stat-card uptime"><div class="val" id="statUptime">0</div><div class="lbl">دقیقه uptime</div></div>
-  </div>
-
-  <div class="section">
-    <div class="section-title">دستگاه‌ها</div>
-    <div id="deviceList"><div class="log-empty">منتظر اتصال دستگاه...</div></div>
-  </div>
-
-  <div class="section">
-    <div class="section-title">آخرین رویدادها</div>
-    <div class="log-list" id="logList">
-      <div class="log-empty">هنوز رویدادی ثبت نشده</div>
-    </div>
-  </div>
+<div class="header"><h1>🌿 گلخانه هوشمند</h1><span class="badge" id="wsBadge">اتصال...</span></div>
+<div class="bar"><span class="lu" id="lu">--</span><button onclick="rf()">🔄 به‌روزرسانی</button></div>
+<div class="stats">
+<div class="stat g"><div class="v" id="sd">0</div><div class="l">دستگاه</div></div>
+<div class="stat b"><div class="v" id="se">0</div><div class="l">رویداد امروز</div></div>
+<div class="stat y"><div class="v" id="su">0</div><div class="l">دقیقه</div></div>
 </div>
-
+<div class="section"><div class="stitle">📡 دستگاه‌ها</div><div id="dl"><div class="empty">منتظر اتصال...</div></div></div>
+<div class="section"><div class="stitle">📋 آخرین رویدادها</div><div class="card" id="ll"><div class="empty">بدون رویداد</div></div></div>
+</div>
 <script>
-const API = window.location.origin;
-const WS_URL = (API.startsWith('https') ? 'wss://' : 'ws://') + window.location.host + '/ws?device=browser';
-let ws, lastUpdate = Date.now();
-
-function initWS() {
-  try {
-    ws = new WebSocket(WS_URL);
-    ws.onopen = () => { document.getElementById('connStatus').textContent = 'متصل'; loadStats(); loadDevices(); loadEvents(); };
-    ws.onclose = () => { document.getElementById('connStatus').textContent = 'قطع - تلاش مجدد...'; setTimeout(initWS, 3000); };
-    ws.onerror = () => ws.close();
-    ws.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'events') appendEvents(msg.events || []);
-        if (msg.type === 'devices') renderDevices(msg.devices || []);
-        if (msg.type === 'connected') document.getElementById('connStatus').textContent = 'متصل';
-      } catch(ex) {}
-    };
-  } catch(e) { setTimeout(initWS, 3000); }
-}
-
-function fmtTime(ts) {
-  const d = new Date(ts);
-  return d.toLocaleTimeString('fa-IR', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-}
-
-function fmtRelative(ts) {
-  const diff = Date.now() - ts;
-  if (diff < 60000) return 'اکنون';
-  if (diff < 3600000) return Math.floor(diff/60000) + ' دقیقه پیش';
-  return Math.floor(diff/3600000) + ' ساعت پیش';
-}
-
-async function loadStats() {
-  try {
-    const r = await fetch(API+'/api/stats');
-    const d = await r.json();
-    document.getElementById('statDevices').textContent = d.devices || 0;
-    document.getElementById('statEvents').textContent = d.todayEvents || 0;
-    document.getElementById('statUptime').textContent = Math.floor((Date.now()-lastUpdate)/60000);
-  } catch(e) {}
-}
-
-async function loadDevices() {
-  try {
-    const r = await fetch(API+'/api/devices');
-    const d = await r.json();
-    renderDevices(d.devices || []);
-  } catch(e) {}
-}
-
-function renderDevices(list) {
-  const el = document.getElementById('deviceList');
-  if (list.length === 0) { el.innerHTML = '<div class="log-empty">دستگاهی متصل نیست</div>'; return; }
-  el.innerHTML = list.map(d => \`
-    <div class="device-card">
-      <div>
-        <div class="dev-id">📡 \${d.deviceId}</div>
-        <div class="dev-info">uptime: \${Math.floor((d.uptime||0)/60000)} دقیقه | \${fmtRelative(d.lastSeen)}</div>
-      </div>
-      <div class="dev-status \${d.online?'online':'offline'}">\${d.online?'آنلاین':'آفلاین'}</div>
-    </div>\`).join('');
-}
-
-async function loadEvents() {
-  try {
-    const r = await fetch(API+'/api/events?limit=30');
-    const d = await r.json();
-    appendEvents(d.events || [], true);
-  } catch(e) {}
-}
-
-function appendEvents(events, replace=false) {
-  const el = document.getElementById('logList');
-  if (replace) el.innerHTML = '';
-  if (!events.length && replace) { el.innerHTML = '<div class="log-empty">هنوز رویدادی ثبت نشده</div>'; return; }
-  const items = events.slice(-30).reverse().map(e => \`
-    <div class="log-item">
-      <span class="evt-type">\${e.event_type || e.type}</span>
-      <span class="evt-state">\${e.state || ''}</span>
-      <span class="evt-time">\${fmtTime(e.ts || e.received_at)}</span>
-    </div>\`).join('');
-  if (replace) { el.innerHTML = items || '<div class="log-empty">هنوز رویدادی ثبت نشده</div>'; }
-  else { el.insertAdjacentHTML('afterbegin', items); }
-  document.getElementById('lastUpdate').textContent = 'آخرین به‌روزرسانی: ' + fmtTime(Date.now());
-  lastUpdate = Date.now();
-}
-
-function refreshAll() { loadStats(); loadDevices(); loadEvents(); }
-
-// Auto refresh every 30s
-setInterval(refreshAll, 30000);
-initWS();
-refreshAll();
+const A=location.origin,W=(A.startsWith('https')?'wss://':'ws://')+location.host+'/ws?device=browser';
+let ws,now=Date.now();
+function X(){try{ws=new WebSocket(W);ws.onopen=()=>{G('wsBadge','متصل');L();D();E()};ws.onclose=()=>{G('wsBadge','قطع');setTimeout(X,3000)};ws.onerror=()=>ws.close();ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==='events')P(m.events||[]);if(m.type==='devices')R(m.devices||[])}catch(ex){}}}catch(e){setTimeout(X,3000)}}
+function G(id,v){document.getElementById(id).textContent=v}
+function F(ts){return new Date(ts).toLocaleTimeString('fa-IR',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+async function L(){try{const r=await fetch(A+'/api/stats'),d=await r.json();G('sd',d.devices||0);G('se',d.todayEvents||0);G('su',Math.floor((Date.now()-now)/60000))}catch(e){}}
+async function D(){try{const r=await fetch(A+'/api/devices'),d=await r.json();R(d.devices||[])}catch(e){}}
+function R(l){const e=document.getElementById('dl');if(!l.length){e.innerHTML='<div class="empty">دستگاهی متصل نیست</div>';return}
+e.innerHTML=l.map(d=>'<div class="card" style="margin-bottom:6px"><div class="dev-row"><div><div class="n">📡 '+d.deviceId+'</div><div class="i">uptime: '+Math.floor((d.uptime||0)/60000)+' دقیقه</div></div><span class="dev-dot '+(d.online?'on':'off')+'">'+(d.online?'آنلاین':'آفلاین')+'</span></div></div>').join('')}
+async function E(){try{const r=await fetch(A+'/api/events?limit=30'),d=await r.json();P(d.events||[],1)}catch(e){}}
+function P(ev,re){const e=document.getElementById('ll');if(re)e.innerHTML='';if(!ev.length&&re){e.innerHTML='<div class="empty">بدون رویداد</div>';return}
+const i=ev.slice(-30).reverse().map(v=>'<div class="row"><span class="t">'+v.event_type+'</span><span class="s">'+v.state+'</span><span class="tm">'+F(v.ts||v.received_at)+'</span></div>').join('');
+if(re)e.innerHTML=i||'<div class="empty">بدون رویداد</div>';else e.insertAdjacentHTML('afterbegin',i);G('lu','به‌روز: '+F(Date.now()));now=Date.now()}
+function rf(){L();D();E()}
+setInterval(rf,30000);X();rf();
 </script>
-</body>
-</html>`;
+</body></html>`;
 }
 
 // --------------- Start ---------------
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Server] Smart Greenhouse running on port ${PORT}`);
-  console.log(`[Server] API Key: ${API_KEY.substring(0,8)}...`);
+  console.log(`[Server] Greenhouse running on port ${PORT}`);
+  console.log(`[Server] API: http://0.0.0.0:${PORT}`);
+  console.log(`[Server] Dashboard: http://<server-ip>:${PORT}`);
 });
 
-// Graceful shutdown
-process.on('SIGINT', () => { console.log('\n[Server] Shutting down...'); if (db && db.close) db.close(); process.exit(); });
+process.on('SIGINT', () => { saveEvents(); saveDevices(); process.exit(); });
+process.on('SIGTERM', () => { saveEvents(); saveDevices(); process.exit(); });
+
+// Periodic save
+setInterval(() => { saveEvents(); saveDevices(); }, 30000);
