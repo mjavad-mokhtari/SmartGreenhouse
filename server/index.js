@@ -291,8 +291,6 @@ app.post('/setup', async (req, res) => {
   }
 });
 
-app.get('/logout', (req, res) => { req.session.destroy(); res.redirect('/login'); });
-
 // =========== 2FA RECOVERY ===========
 app.get('/recover-2fa', (req, res) => {
   res.type('html').send(recoverPage());
@@ -318,6 +316,8 @@ app.post('/recover-2fa', (req, res) => {
     res.type('html').send(recoverPage('خطا در بازیابی 2FA'));
   }
 });
+
+app.get('/logout', (req, res) => { req.session.destroy(); res.redirect('/login'); });
 
 // =========== DASHBOARD (after auth) ===========
 app.get('/', requireAuth, (req, res) => {
@@ -346,6 +346,20 @@ wss.on('connection', (ws, req) => {
 
 // =========== PAGES ===========
 
+function recoverPage(error) {
+  const err = error ? `<div style="background:rgba(239,68,68,.15);color:#ef4444;padding:10px;border-radius:8px;margin-bottom:16px;font-size:13px">${error}</div>` : '';
+  return `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی 2FA | خانه سبز هوشمند</title>
+<style>:root{--bg:#0f172a;--card:#1e293b;--accent:#10b981;--text:#f1f5f9;--sub:#94a3b8;--radius:14px}
+*{margin:0;padding:0;box-sizing:border-box}body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.box{background:var(--card);border-radius:var(--radius);padding:28px 22px;width:100%;max-width:380px}
+.box h2{text-align:center;margin-bottom:6px;font-size:20px}.box .sub{text-align:center;color:var(--sub);font-size:12px;margin-bottom:20px}
+.inp{width:100%;padding:12px;margin-bottom:10px;background:#0f172a;border:1px solid rgba(255,255,255,.1);border-radius:10px;color:var(--text);font-size:14px;outline:none}
+.inp:focus{border-color:var(--accent)}
+.btn{width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;margin-top:6px}
+</style></head><body><div class="box"><h2>🔐 بازیابی 2FA</h2><div class="sub">برای دریافت مجدد QR کد، نام کاربری و رمز عبور خود را وارد کنید</div>${err}
+<form method="POST"><input class="inp" name="username" placeholder="نام کاربری" required><input class="inp" type="password" name="password" placeholder="رمز عبور" required><button class="btn" type="submit">دریافت QR کد</button></form><div style="text-align:center;margin-top:12px"><a href="/login" style="color:var(--sub);font-size:12px">بازگشت به صفحه ورود</a></div></div></body></html>`;
+}
+
 function loginPage(error) {
   const err = error ? `<div style="background:rgba(239,68,68,.15);color:#ef4444;padding:10px;border-radius:8px;margin-bottom:16px;font-size:13px">${error}</div>` : '';
   return `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ورود | خانه سبز هوشمند</title>
@@ -362,21 +376,6 @@ function loginPage(error) {
 }
 
 function setupPage(error) {
-
-function recoverPage(error) {
-  const err = error ? `<div style="background:rgba(239,68,68,.15);color:#ef4444;padding:10px;border-radius:8px;margin-bottom:16px;font-size:13px">${error}</div>` : '';
-  return `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی 2FA | خانه سبز هوشمند</title>
-<style>:root{--bg:#0f172a;--card:#1e293b;--accent:#10b981;--text:#f1f5f9;--sub:#94a3b8;--radius:14px}
-*{margin:0;padding:0;box-sizing:border-box}body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.box{background:var(--card);border-radius:var(--radius);padding:28px 22px;width:100%;max-width:380px}
-.box h2{text-align:center;margin-bottom:6px;font-size:20px}.box .sub{text-align:center;color:var(--sub);font-size:12px;margin-bottom:20px}
-.inp{width:100%;padding:12px;margin-bottom:10px;background:#0f172a;border:1px solid rgba(255,255,255,.1);border-radius:10px;color:var(--text);font-size:14px;outline:none}
-.inp:focus{border-color:var(--accent)}
-.btn{width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;margin-top:6px}
-</style></head><body><div class="box"><h2>🔐 بازیابی 2FA</h2><div class="sub">برای دریافت مجدد QR کد، نام کاربری و رمز عبور خود را وارد کنید</div>${err}
-<form method="POST"><input class="inp" name="username" placeholder="نام کاربری" required><input class="inp" type="password" name="password" placeholder="رمز عبور" required><button class="btn" type="submit">دریافت QR کد</button></form><div style="text-align:center;margin-top:12px"><a href="/login" style="color:var(--sub);font-size:12px">بازگشت به صفحه ورود</a></div></div></body></html>`;
-}
-
   const err = error ? `<div style="background:rgba(239,68,68,.15);color:#ef4444;padding:10px;border-radius:8px;margin-bottom:16px;font-size:13px">${error}</div>` : '';
   return `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>راه‌اندازی | خانه سبز هوشمند</title>
 <style>:root{--bg:#0f172a;--card:#1e293b;--accent:#10b981;--text:#f1f5f9;--sub:#94a3b8;--radius:14px}
