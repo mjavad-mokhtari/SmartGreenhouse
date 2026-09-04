@@ -1,5 +1,5 @@
 {
-  "name": "SmartGreenhouse Deploy Telegram Alert",
+  "name": "SmartGreenHome Deploy Telegram Alert",
   "nodes": [
     {
       "parameters": {
@@ -16,7 +16,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const data = $input.first().json;\nconst time = new Date(data.time).toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' });\nreturn {\n  message: `🔄 SmartGreenhouse Deploy\n📦 پروژه: ${data.project}\n📌 نسخه: ${data.version}\n⏰ زمان: ${time}\n✅ وضعیت: ${data.status}`\n};"
+        "jsCode": "const data = $input.first().json;\nconst time = new Date(data.time).toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' });\nreturn {\n  message: `🔄 SmartGreenHome Deploy\n📦 پروژه: ${data.project}\n📌 نسخه: ${data.version}\n⏰ زمان: ${time}\n✅ وضعیت: ${data.status}`\n};"
       },
       "id": "format-msg",
       "name": "Format Message",
@@ -36,7 +36,7 @@
       "typeVersion": 1,
       "position": [650, 300],
       "credentials": {
-        "telegramApi": "smartgreenhouse-telegram-bot"
+        "telegramApi": "smartgreenhome-telegram-bot"
       }
     }
   ],

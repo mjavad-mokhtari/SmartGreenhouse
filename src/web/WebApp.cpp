@@ -222,7 +222,7 @@ String WebApp::buildFullDashboard() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<title>SGH</title>
+<title>خانه سبز هوشمند</title>
 <style>
 :root{--bg:#0f1115;--card:#1a1d22;--fg:#e2e6e9;--accent:#4ade80;--warn:#fbbf24;--red:#f87171;--muted:#6b7280;--border:#2a2d33;--radius:12px}
 *,*::before,*::after{box-sizing:border-box}
@@ -278,7 +278,7 @@ main{max-width:640px;margin:auto;padding:16px}
 </head>
 <body>
 <main>
-<div class="topbar"><h1>SGH</h1><span class="tm" id="clock">--:--</span></div>
+<div class="topbar"><h1>🏠 خانه سبز هوشمند</h1><span class="tm" id="clock">--:--</span></div>
 
 <!-- Insight bar -->
 <div class="insights" id="insights"></div>

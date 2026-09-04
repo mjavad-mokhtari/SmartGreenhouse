@@ -52,7 +52,7 @@ void setup() {
   wifi.begin();
 
   // --- OTA Setup ---
-  ArduinoOTA.setHostname("smartgreenhouse");
+  ArduinoOTA.setHostname("smartgreenhome");
   ArduinoOTA.setPassword("greenhouse_ota");
   ArduinoOTA.onStart([]() {
     Serial.println("[OTA] Start updating firmware...");

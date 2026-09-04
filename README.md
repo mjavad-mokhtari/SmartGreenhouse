@@ -1,4 +1,4 @@
-# SGH Controller
+# SmartGreenHome Controller
 
 Local-first ESP32 controller with independently compiled irrigation and lighting services.
 
