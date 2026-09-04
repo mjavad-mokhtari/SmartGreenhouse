@@ -1,7 +1,7 @@
 {
-  "name": "smart-greenhouse-server",
-  "version": "1.0.0",
-  "description": "Smart Greenhouse Central Server - Dashboard & API",
+  "name": "smartgreenhouse-server",
+  "version": "2.0.0",
+  "description": "Smart Greenhouse Central Server - 2FA + Timeline + Dashboard",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -9,6 +9,9 @@
   },
   "dependencies": {
     "express": "^4.21.0",
-    "ws": "^8.18.0"
+    "express-session": "^1.18.0",
+    "ws": "^8.18.0",
+    "otplib": "^12.0.1",
+    "qrcode": "^1.5.3"
   }
 }

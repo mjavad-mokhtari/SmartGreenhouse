@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+server/node_modules/
+server/greenhouse.db
+server/greenhouse.db-*
