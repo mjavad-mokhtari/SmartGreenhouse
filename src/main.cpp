@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <esp_system.h>
+#include <ArduinoOTA.h>
 #include "core/Services.h"
 #ifdef MODULE_IRRIGATION
 #include "modules/irrigation/IrrigationService.h"
@@ -49,6 +50,29 @@ void setup() {
 #endif
 
   wifi.begin();
+
+  // --- OTA Setup ---
+  ArduinoOTA.setHostname("smartgreenhouse");
+  ArduinoOTA.setPassword("greenhouse_ota");
+  ArduinoOTA.onStart([]() {
+    Serial.println("[OTA] Start updating firmware...");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("[OTA] Update complete. Rebooting...");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("[OTA] Progress: %u%%\r", (progress * 100) / total);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("[OTA] Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+  Serial.println("[OTA] Ready. Password: greenhouse_ota");
 
   // Load sync config
   syncLoadConfig();
@@ -199,6 +223,9 @@ void loop() {
 
   webApp.update();
   syncLoop();
+
+  // Handle OTA updates
+  ArduinoOTA.handle();
 
   handleCLI();
   delay(2);

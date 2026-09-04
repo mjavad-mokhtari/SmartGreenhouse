@@ -1,0 +1,59 @@
+{
+  "name": "SmartGreenhouse Deploy Telegram Alert",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "deploy",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-deploy",
+      "name": "Webhook - Deploy",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst time = new Date(data.time).toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' });\nreturn {\n  message: `🔄 SmartGreenhouse Deploy\n📦 پروژه: ${data.project}\n📌 نسخه: ${data.version}\n⏰ زمان: ${time}\n✅ وضعیت: ${data.status}`\n};"
+      },
+      "id": "format-msg",
+      "name": "Format Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_CHAT_ID",
+        "text": "={{ $json.message }}",
+        "additionalFields": {}
+      },
+      "id": "telegram-send",
+      "name": "Telegram Send",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "telegramApi": "smartgreenhouse-telegram-bot"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook - Deploy": {
+      "main": [
+        [{ "node": "Format Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Message": {
+      "main": [
+        [{ "node": "Telegram Send", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  }
+}
