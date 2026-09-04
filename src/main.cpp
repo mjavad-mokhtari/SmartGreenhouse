@@ -207,6 +207,211 @@ void handleCLI() {
   }
 }
 
+String buildServerStatusJson() {
+  DynamicJsonDocument doc(2048);
+  JsonObject root = doc.to<JsonObject>();
+  DateTime now = rtc.now();
+  char timeBuf[20];
+  snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02d %02d:%02d:%02d",
+    now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+  root["time"] = timeBuf;
+  root["uptime"] = millis();
+  root["freeHeap"] = ESP.getFreeHeap();
+
+  JsonObject w = root.createNestedObject("wifi");
+  w["connected"] = wifi.connected();
+  w["ip"] = wifi.ip();
+  w["network"] = wifi.network();
+  w["apMode"] = wifi.isAccessPoint();
+
+  JsonObject r = root.createNestedObject("rtc");
+  r["available"] = rtc.isAvailable();
+  r["valid"] = (now.year() >= 2020);
+  r["year"] = now.year();
+  r["month"] = now.month();
+  r["day"] = now.day();
+  r["hour"] = now.hour();
+  r["minute"] = now.minute();
+  r["second"] = now.second();
+
+  JsonObject h = root.createNestedObject("health");
+  h["wifiDisconnected"] = !wifi.connected();
+  h["rtcValid"] = (now.year() >= 2020);
+  h["freeHeapKB"] = ESP.getFreeHeap() / 1024;
+  h["uptimeMin"] = millis() / 60000;
+
+#ifdef MODULE_IRRIGATION
+  irrigation.appendStatus(root);
+#endif
+#ifdef MODULE_LIGHTING
+  lighting.appendStatus(root);
+#endif
+
+  String out;
+  serializeJson(root, out);
+  return out;
+}
+
+// --- Remote server command executor ---
+void applyRemoteCommand(const String& action, JsonObject params, const String& commandId, String& ackedIdsCsv, size_t& ackCount) {
+#ifdef MODULE_IRRIGATION
+  if (action == "zone/on") {
+    int zoneId = params["id"] | -1;
+    int dur = params["dur"] | 15;
+    if (dur <= 0) dur = 15;
+    int idx = irrigation.findZone((uint8_t)zoneId);
+    if (idx >= 0 && irrigation.start(idx, (uint16_t)dur, "REMOTE")) {
+      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+      ackCount++;
+    }
+    return;
+  }
+  if (action == "zone/off") {
+    int zoneId = params["id"] | -1;
+    int idx = irrigation.findZone((uint8_t)zoneId);
+    if (idx >= 0 && irrigation.stop(idx, "REMOTE")) {
+      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+      ackCount++;
+    }
+    return;
+  }
+  if (action == "zone/schedule") {
+    int zoneId = params["id"] | -1;
+    int hour = params["hour"] | 0;
+    int minute = params["minute"] | 0;
+    int dur = params["dur"] | 15;
+    int idx = irrigation.findZone((uint8_t)zoneId);
+    if (idx >= 0 && irrigation.setSchedule(idx, (uint8_t)hour, (uint8_t)minute, (uint16_t)dur)) {
+      queueEvent("schedule", "set");
+      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+      ackCount++;
+    }
+    return;
+  }
+  if (action == "pump/on") {
+    irrigation.clearPumpOverride();
+    irrigation.setPump(true, "REMOTE");
+    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+    ackCount++;
+    return;
+  }
+  if (action == "pump/off") {
+    irrigation.clearPumpOverride();
+    for (uint8_t i = 0; i < irrigation.zoneCount(); i++) irrigation.stop(i, "REMOTE");
+    irrigation.setPump(false, "REMOTE");
+    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+    ackCount++;
+    return;
+  }
+  if (action == "e") {
+    irrigation.clearPumpOverride();
+    for (uint8_t i = 0; i < irrigation.zoneCount(); i++) irrigation.stop(i, "REMOTE");
+    irrigation.setPump(false, "REMOTE");
+    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+    ackCount++;
+    return;
+  }
+  if (action == "config/time") {
+    int year = params["year"] | 2026;
+    int month = params["month"] | 1;
+    int day = params["day"] | 1;
+    int hour = params["hour"] | 0;
+    int minute = params["minute"] | 0;
+    rtc.set(DateTime(year, month, day, hour, minute, 0));
+    queueEvent("config", "time-set");
+    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+    ackCount++;
+    return;
+  }
+  if (action == "config/sync") {
+    String url = params["url"] | String("");
+    String apiKey = params["apiKey"] | String("");
+    if (url.length()) {
+      setServerUrl(url);
+      setServerEnabled(true);
+      if (apiKey.length() > 0) setApiKey(apiKey);
+      queueEvent("config", "sync-set");
+      syncTriggerNow();
+      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+      ackCount++;
+    }
+    return;
+  }
+#endif
+#ifdef MODULE_LIGHTING
+  if (action == "lighting/toggle") {
+    int id = params["id"] | 0;
+    if (lighting.toggleChannel((uint8_t)id)) {
+      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+      ackCount++;
+    }
+    return;
+  }
+  if (action == "lighting/all-on") {
+    lighting.allOn();
+    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+    ackCount++;
+    return;
+  }
+  if (action == "lighting/all-off") {
+    lighting.allOff();
+    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+    ackCount++;
+    return;
+  }
+#endif
+  if (action == "config/wifi") {
+    const String ssid = params["ssid"] | String("");
+    const String password = params["password"] | String("");
+    if (ssid.length()) {
+      wifi.save(ssid, password);
+      queueEvent("config", "wifi-set");
+      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
+      ackCount++;
+      syncTriggerNow();
+    }
+  }
+}
+
+void pollAndExecuteServerCommands() {
+  static uint32_t lastPoll = 0;
+  static uint32_t pollInterval = 3000;
+  uint32_t now = millis();
+  if ((now - lastPoll) < pollInterval) return;
+  lastPoll = now;
+
+  if (!getServerEnabled() || WiFi.status() != WL_CONNECTED || getServerUrl().length() == 0) {
+    return;
+  }
+
+  String response;
+  if (!pollServerCommands(response, 2500)) return;
+
+  const size_t cap = 2048;
+  DynamicJsonDocument doc(cap);
+  if (deserializeJson(doc, response) != DeserializationError::Ok) return;
+  if (!doc["ok"].as<bool>()) return;
+
+  JsonArray cmds = doc["commands"].as<JsonArray>();
+  if (!cmds || cmds.isNull() || cmds.size() == 0) return;
+
+  String ackIds = "[";
+  size_t ackCount = 0;
+
+  for (JsonObject item : cmds) {
+    const String action = item["action"] | String("");
+    JsonObject params = item["params"] | JsonObject();
+      const String commandId = item["id"] | String("");
+      if (commandId.length() == 0 || action.length() == 0) continue;
+      applyRemoteCommand(action, params, commandId, ackIds, ackCount);
+  }
+
+  if (ackCount > 0) {
+    ackIds += "]";
+    ackServerCommands(ackIds);
+  }
+}
+
 void loop() {
   uint32_t now = millis();
 
@@ -222,10 +427,17 @@ void loop() {
 #endif
 
   webApp.update();
-  syncLoop();
+  static String serverStatusCache;
+  static uint32_t serverStatusCacheTs = 0;
+  if (serverStatusCacheTs == 0 || (now - serverStatusCacheTs) >= 5000) {
+    serverStatusCache = buildServerStatusJson();
+    serverStatusCacheTs = now;
+  }
+  syncLoop(serverStatusCache);
 
   // Handle OTA updates
   ArduinoOTA.handle();
+  pollAndExecuteServerCommands();
 
   handleCLI();
   delay(2);

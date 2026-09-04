@@ -155,7 +155,7 @@ bool IrrigationService::start(int idx, uint16_t durationMin, const char* reason)
   zoneWrite(z.pin, true);
   reconcilePump();
   triggerLed();
-  queueEvent("zone", "start");
+  queueEvent("zone", String("start ") + "zone" + String(z.id) + " " + String(durationMin) + "min");
   return true;
 }
 
@@ -168,7 +168,7 @@ bool IrrigationService::stop(int idx, const char* reason) {
   zoneWrite(z.pin, false);
   reconcilePump();
   triggerLed();
-  queueEvent("zone", "stop");
+  queueEvent("zone", String("stop ") + "zone" + String(z.id));
   return true;
 }
 
@@ -226,7 +226,7 @@ void IrrigationService::checkSchedules(uint32_t now) {
     if (zones[i].running) {
       uint32_t elapsedMs = now - zones[i].started;
       if (elapsedMs >= (uint32_t)zones[i].duration * 60000UL) {
-        queueEvent("zone", "completed");
+        queueEvent("zone", String("completed zone") + String(zones[i].id));
         stop(i, "Completed");
       }
     }
@@ -241,7 +241,7 @@ void IrrigationService::checkSchedules(uint32_t now) {
     if (!z.days[day7(n.dayOfTheWeek())]) continue;
     if (n.hour() != z.hour || n.minute() != z.minute) continue;
     z.ranToday = true;
-    queueEvent("zone", "scheduled");
+    queueEvent("zone", String("scheduled zone") + String(z.id) + " " + (z.hour < 10 ? "0" : "") + String(z.hour) + ":" + (z.minute < 10 ? "0" : "") + String(z.minute));
     start(i, z.duration, "SCHEDULED");
   }
 }

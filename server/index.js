@@ -13,19 +13,27 @@ const EVENTS_FILE = path.join(DATA_DIR, 'events.json');
 const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const FIRMWARE_DIR = path.join(__dirname, 'firmware');
+const COMMANDS_FILE = path.join(DATA_DIR, 'commands.json');
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const MAX_EVENTS = 20000;
+const COMMAND_TTL_MS = 24 * 60 * 60 * 1000;
+const COMMAND_POLL_LIMIT = 50;
 
 // --------------- Store ---------------
 let events = [];
 let deviceStates = {};
 let users = [];
+let commands = {};
 
 function initStore() {
   [DATA_DIR, FIRMWARE_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
   try { events = JSON.parse(fs.readFileSync(EVENTS_FILE, 'utf8') || '[]'); } catch(e) { events = []; }
   try { deviceStates = JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8') || '{}'); } catch(e) { deviceStates = {}; }
   try { users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8') || '[]'); } catch(e) { users = []; }
+  try {
+    commands = JSON.parse(fs.readFileSync(COMMANDS_FILE, 'utf8') || '{}');
+    if (typeof commands !== 'object' || commands === null) commands = {};
+  } catch(e) { commands = {}; }
   console.log(`[Store] ${events.length} events, ${Object.keys(deviceStates).length} devices, ${users.length} users`);
 }
 
@@ -41,6 +49,9 @@ function saveDevices() {
 function saveUsers() {
   try { fs.writeFileSync(USERS_FILE, JSON.stringify(users), 'utf8'); } catch(e) {}
 }
+function saveCommands() {
+  try { fs.writeFileSync(COMMANDS_FILE, JSON.stringify(commands), 'utf8'); } catch(e) {}
+}
 
 function addEvent(deviceId, type, state, ts) {
   const e = { id: events.length + 1, device_id: deviceId, event_type: type, state, ts: ts || Date.now(), received_at: Date.now() };
@@ -52,7 +63,11 @@ function addEvent(deviceId, type, state, ts) {
 function getStats() {
   const todayStart = new Date(); todayStart.setHours(0,0,0,0);
   const today = events.filter(e => e.received_at >= todayStart.getTime());
-  const irrigationMinutes = today.filter(e => e.event_type === 'zone' && e.state.startsWith('start')).length * 15;
+  const irrigationStarts = today.filter(e => e.event_type === 'zone' && String(e.state || '').startsWith('start'));
+  const irrigationMinutes = irrigationStarts.reduce((total, event) => {
+    const match = String(event.state || '').match(/(\d+)\s*min/i);
+    return total + (match ? parseInt(match[1], 10) : 15);
+  }, 0);
   return {
     devices: Object.keys(deviceStates).length,
     todayEvents: today.length,
@@ -60,6 +75,25 @@ function getStats() {
     irrigationMinutes,
     lastIrrigation: today.filter(e => e.event_type === 'pump' && e.state === 'on').slice(-1)[0] || null
   };
+}
+
+function getPrimaryDeviceId() {
+  const entries = Object.entries(deviceStates);
+  if (!entries.length) return null;
+  const online = entries.find(([, info]) => (Date.now() - (info.lastSeen || 0)) < 120000);
+  if (online) return online[0];
+  return entries.sort((a, b) => (b[1].lastSeen || 0) - (a[1].lastSeen || 0))[0][0];
+}
+
+function getPrimaryDeviceState() {
+  const id = getPrimaryDeviceId();
+  if (!id) return null;
+  return deviceStates[id] || null;
+}
+
+function ensureNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 // --------------- 2FA / TOTP ---------------
@@ -110,9 +144,66 @@ app.use((req, res, next) => {
 
 function requireAuth(req, res, next) {
   if (req.session && req.session.user) return next();
-  if (req.path === '/login' || req.path === '/setup' || req.path === '/api/events' || req.path === '/api/health') return next();
+  if (req.path === '/login' || req.path === '/setup' || req.path === '/api/events' || req.path === '/api/commands' || req.path === '/api/commands/ack' || req.path === '/api/health') return next();
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'unauthorized' });
   return res.redirect('/login');
+}
+
+function requireApiKey(req, res, next) {
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) return next();
+  const provided = req.headers['x-api-key'] || req.headers['x-apikey'] || '';
+  if (provided !== apiKey) return res.status(401).json({ error: 'invalid api key' });
+  next();
+}
+
+function requireControl(req, res, next) {
+  if (req.session && req.session.user) return next();
+  return requireApiKey(req, res, next);
+}
+
+function nowTs() { return Date.now(); }
+
+function pickDeviceId(requestedId = '') {
+  if (requestedId && deviceStates[requestedId]) return requestedId;
+  const firstOnline = Object.entries(deviceStates).find(([, info]) => (Date.now() - (info.lastSeen || 0)) < 120000);
+  if (firstOnline) return firstOnline[0];
+  return requestedId || null;
+}
+
+function pruneExpiredCommands() {
+  const now = nowTs();
+  Object.keys(commands).forEach((deviceId) => {
+    const list = commands[deviceId] || [];
+    const alive = list.filter((c) => !c.createdAt || (now - c.createdAt) < COMMAND_TTL_MS);
+    if (!alive.length) delete commands[deviceId];
+    else commands[deviceId] = alive;
+  });
+}
+
+function newCommandId() {
+  return `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6)}`;
+}
+
+function pushCommand(deviceId, action, params = {}) {
+  const id = newCommandId();
+  if (!commands[deviceId]) commands[deviceId] = [];
+  commands[deviceId].push({ id, action, params, createdAt: nowTs(), source: 'dashboard' });
+  if (commands[deviceId].length > COMMAND_POLL_LIMIT) {
+    commands[deviceId] = commands[deviceId].slice(-COMMAND_POLL_LIMIT);
+  }
+  saveCommands();
+  return { id, action, params, createdAt: nowTs() };
+}
+
+function ackCommands(deviceId, ids = []) {
+  if (!commands[deviceId]) return 0;
+  const before = commands[deviceId].length;
+  const remove = new Set(ids.map((x) => String(x)));
+  commands[deviceId] = commands[deviceId].filter((c) => !remove.has(String(c.id)));
+  const removed = before - commands[deviceId].length;
+  if (removed > 0) saveCommands();
+  return removed;
 }
 
 initStore();
@@ -133,7 +224,12 @@ app.post('/api/events', (req, res) => {
   }
   const { deviceId, uptime, events: evts, status: devStatus } = req.body;
   if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-  deviceStates[deviceId] = { lastSeen: Date.now(), uptime: uptime || 0, ip: req.ip, status: devStatus || {} };
+  deviceStates[deviceId] = {
+    lastSeen: Date.now(),
+    uptime: uptime || 0,
+    ip: req.ip,
+    status: devStatus && typeof devStatus === 'object' ? devStatus : (devStatus || {})
+  };
   saveDevices();
   let received = 0;
   if (evts && evts.length > 0) { for (const e of evts) { addEvent(deviceId, e.type, e.state, e.ts); received++; } }
@@ -141,6 +237,8 @@ app.post('/api/events', (req, res) => {
   broadcastDeviceStatus();
   res.json({ ok: true, received });
 });
+
+// Fetch pending commands for a device (long polling friendly)
 
 // Get events
 app.get('/api/events', (req, res) => {
@@ -158,6 +256,138 @@ app.get('/api/devices', (req, res) => {
 
 // Stats
 app.get('/api/stats', (req, res) => { res.json(getStats()); });
+
+// Control endpoints (UI or board bridge)
+app.post('/api/zone/on', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const zoneId = parseInt(req.body.id || req.query.id || req.body.zoneId || req.query.zoneId, 10);
+  const duration = parseInt(req.body.dur || req.body.duration || req.query.duration || 15, 10);
+  if (!Number.isFinite(zoneId) || zoneId <= 0) return res.status(400).json({ error: 'invalid zone id' });
+  const command = pushCommand(deviceId, 'zone/on', { id: zoneId, dur: duration });
+  res.json({ ok: true, command });
+});
+
+app.post('/api/zone/off', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const zoneId = parseInt(req.body.id || req.query.id || req.body.zoneId || req.query.zoneId, 10);
+  if (!Number.isFinite(zoneId) || zoneId <= 0) return res.status(400).json({ error: 'invalid zone id' });
+  const command = pushCommand(deviceId, 'zone/off', { id: zoneId });
+  res.json({ ok: true, command });
+});
+
+app.post('/api/zone/schedule', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const zoneId = parseInt(req.body.id || req.query.id || req.body.zoneId || req.query.zoneId, 10);
+  const hour = parseInt(req.body.hour || req.query.hour, 10);
+  const minute = parseInt(req.body.minute || req.query.minute, 10);
+  const dur = parseInt(req.body.dur || req.body.duration || req.query.dur || req.query.duration || req.query.min, 10);
+  if (!Number.isFinite(zoneId) || zoneId <= 0) return res.status(400).json({ error: 'invalid zone id' });
+  if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+    return res.status(400).json({ error: 'invalid schedule time' });
+  if (!Number.isFinite(dur) || dur < 1 || dur > 480) return res.status(400).json({ error: 'invalid duration' });
+  const command = pushCommand(deviceId, 'zone/schedule', { id: zoneId, hour, minute, dur });
+  res.json({ ok: true, command });
+});
+
+app.post('/api/pump/on', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const command = pushCommand(deviceId, 'pump/on', {});
+  res.json({ ok: true, command });
+});
+
+app.post('/api/pump/off', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const command = pushCommand(deviceId, 'pump/off', {});
+  res.json({ ok: true, command });
+});
+
+app.post('/api/e', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const command = pushCommand(deviceId, 'e', {});
+  res.json({ ok: true, command });
+});
+
+app.post('/api/lighting/toggle', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const id = parseInt(req.body.id || req.query.id, 10);
+  if (!Number.isFinite(id) || id < 0) return res.status(400).json({ error: 'invalid channel id' });
+  const command = pushCommand(deviceId, 'lighting/toggle', { id });
+  res.json({ ok: true, command });
+});
+
+app.post('/api/lighting/all-on', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const command = pushCommand(deviceId, 'lighting/all-on', {});
+  res.json({ ok: true, command });
+});
+
+app.post('/api/lighting/all-off', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const command = pushCommand(deviceId, 'lighting/all-off', {});
+  res.json({ ok: true, command });
+});
+
+app.post('/api/config/sync', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const url = String(req.body.url || req.query.url || '').trim();
+  if (!url) return res.status(400).json({ error: 'url required' });
+  const command = pushCommand(deviceId, 'config/sync', { url });
+  res.json({ ok: true, command });
+});
+
+app.post('/api/config/time', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const p = req.body || {};
+  const year = parseInt(p.year || req.query.year, 10);
+  const month = parseInt(p.month || req.query.month, 10);
+  const day = parseInt(p.day || req.query.day, 10);
+  const hour = parseInt(p.hour || req.query.hour, 10);
+  const minute = parseInt((p.minute || p.mi || req.query.minute || req.query.mi), 10);
+  if (![year, month, day, hour, minute].every((v) => Number.isFinite(v))) {
+    return res.status(400).json({ error: 'invalid time fields' });
+  }
+  const command = pushCommand(deviceId, 'config/time', { year, month, day, hour, minute });
+  res.json({ ok: true, command });
+});
+
+app.post('/api/config/wifi', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const ssid = (req.body.ssid || req.query.ssid || '').trim();
+  const password = String(req.body.password || req.query.password || '');
+  if (!ssid) return res.status(400).json({ error: 'ssid required' });
+  const command = pushCommand(deviceId, 'config/wifi', { ssid, password });
+  res.json({ ok: true, command });
+});
+
+app.get('/api/commands', requireApiKey, (req, res) => {
+  pruneExpiredCommands();
+  const deviceId = String(req.query.device || req.headers['x-device-id'] || 'esp32-smarthome');
+  const list = commands[deviceId] || [];
+  const limit = Math.min(Math.max(1, parseInt(req.query.limit || COMMAND_POLL_LIMIT, 10)), COMMAND_POLL_LIMIT);
+  const payload = list.slice(0, Math.max(1, limit));
+  res.json({ ok: true, deviceId, count: payload.length, commands: payload, pending: list.length });
+});
+
+// Device ACK consumed commands
+app.post('/api/commands/ack', requireApiKey, (req, res) => {
+  const deviceId = req.body.deviceId || req.headers['x-device-id'] || 'esp32-smarthome';
+  const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+  const removed = ackCommands(deviceId, ids);
+  pruneExpiredCommands();
+  res.json({ ok: true, removed, remaining: (commands[deviceId] || []).length });
+});
 
 // Irrigation timeline data
 app.get('/api/irrigation/timeline', (req, res) => {
@@ -276,7 +506,7 @@ app.post('/setup', async (req, res) => {
   let qrDataUrl = '';
   if (otplib) {
     totpSecret = otplib.authenticator.generateSecret();
-    const otpauth = otplib.authenticator.keyuri(username, 'SmartGreenHome', totpSecret);
+    const otpauth = otplib.authenticator.keyuri(username, 'خانه سبز هوشمند', totpSecret);
     try {
       qrDataUrl = await QRCode.toDataURL(otpauth, { width: 250 });
     } catch(err) { console.log('[Setup] QR generation failed:', err.message); }
@@ -306,7 +536,7 @@ app.post('/recover-2fa', (req, res) => {
     return res.type('html').send(recoverPage('2FA برای این کاربر فعال نیست'));
   }
   try {
-    const otpauth = otplib.authenticator.keyuri(username, 'SmartGreenHome', user.totpSecret);
+    const otpauth = otplib.authenticator.keyuri(username, 'خانه سبز هوشمند', user.totpSecret);
     QRCode.toDataURL(otpauth, { width: 250 }).then(qrDataUrl => {
       res.type('html').send(setupDonePage(qrDataUrl, user.totpSecret));
     }).catch(err => {
@@ -326,7 +556,7 @@ app.get('/emergency-qr', async (req, res) => {
   }
   const user = users[0];
   try {
-    const otpauth = otplib.authenticator.keyuri(user.username, 'SmartGreenHome', user.totpSecret);
+    const otpauth = otplib.authenticator.keyuri(user.username, 'خانه سبز هوشمند', user.totpSecret);
     const qrDataUrl = await QRCode.toDataURL(otpauth, { width: 250 });
     res.type('html').send(setupDonePage(qrDataUrl, user.totpSecret));
   } catch(e) {
@@ -447,7 +677,7 @@ function setupDonePage(qrDataUrl, secret) {
 }
 
 function dashboardPage() {
-  return `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"><title>SmartGreenHome</title>
+  return `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"><title>خانه سبز هوشمند</title>
 <style>
 :root{--bg:#0f172a;--card:#1e293b;--accent:#10b981;--blue:#3b82f6;--danger:#ef4444;--warn:#f59e0b;--text:#f1f5f9;--sub:#94a3b8;--muted:#64748b;--radius:12px;--gap:8px}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -501,7 +731,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 @media(max-width:380px){.stats{grid-template-columns:repeat(2,1fr)}}
 </style></head><body>
 <div class="container">
-<div class="hdr"><h1>🏠 SmartGreenHome</h1><span style="display:flex;align-items:center;gap:8px"><span class="time" id="clock">--</span><span class="dot g" id="dot"></span></span></div>
+<div class="hdr"><h1>🏠 خانه سبز هوشمند</h1><span style="display:flex;align-items:center;gap:8px"><span class="time" id="clock">--</span><span class="dot g" id="dot"></span></span></div>
 <div class="stats">
 <div class="st g"><div class="v" id="s1">0</div><div class="l">دستگاه</div></div>
 <div class="st b"><div class="v" id="s2">0</div><div class="l">رویداد امروز</div></div>
@@ -729,7 +959,35 @@ function getTimelineData() {
 }
 
 function getIrrigationData() {
-  // Build irrigation state from real events
+  const device = getPrimaryDeviceState();
+  if (device && device.status && device.status.irrigation) {
+    const irrigation = Object.assign({}, device.status.irrigation);
+    irrigation.zoneCount = ensureNumber(irrigation.zoneCount, 0);
+    irrigation.pumpOn = !!irrigation.pumpOn;
+    irrigation.pumpManualOverride = !!irrigation.pumpManualOverride;
+    irrigation.pumpGpio = ensureNumber(irrigation.pumpGpio, -1);
+    irrigation.soilRaw = ensureNumber(irrigation.soilRaw, 0);
+    irrigation.soilPercent = ensureNumber(irrigation.soilPercent, 0);
+    if (Array.isArray(irrigation.zones)) {
+      irrigation.zones = irrigation.zones.map((z) => ({
+        id: ensureNumber(z.id, 0),
+        pin: ensureNumber(z.pin, 0),
+        enabled: !!z.enabled,
+        running: !!z.running,
+        active: !!z.running,
+        hour: ensureNumber(z.hour, 0),
+        minute: ensureNumber(z.minute, 0),
+        duration: ensureNumber(z.duration, 15),
+        ranToday: !!z.ranToday,
+        nextRun: z.nextRun || 'None',
+        remainingSec: ensureNumber(z.remainingSec, 0)
+      }));
+      if (!irrigation.zones.length) irrigation.zones = [];
+    }
+    return irrigation;
+  }
+
+  // Build irrigation state from local events fallback
   const zoneMap = {};
   let pumpOn = false;
   for (const e of events) {
@@ -749,6 +1007,36 @@ function getIrrigationData() {
 }
 
 function getLightingData() {
+  const device = getPrimaryDeviceState();
+  if (device && device.status && device.status.lighting) {
+    const lighting = Object.assign({}, device.status.lighting);
+    if (Array.isArray(lighting.state)) {
+      lighting.channels = lighting.state.map((c) => ({
+        id: ensureNumber(c.id, 0),
+        pin: ensureNumber(c.pin, 0),
+        enabled: !!c.enabled,
+        state: !!c.state,
+        scheduleEnabled: !!c.scheduleEnabled,
+        onTime: c.onTime || '00:00',
+        offTime: c.offTime || '00:00'
+      }));
+      delete lighting.state;
+    } else if (Array.isArray(lighting.channels)) {
+      lighting.channels = lighting.channels.map((c) => ({
+        id: ensureNumber(c.id, 0),
+        pin: ensureNumber(c.pin, 0),
+        enabled: !!c.enabled,
+        state: !!c.state,
+        scheduleEnabled: !!c.scheduleEnabled,
+        onTime: c.onTime || '00:00',
+        offTime: c.offTime || '00:00'
+      }));
+    } else {
+      lighting.channels = [];
+    }
+    return lighting;
+  }
+
   const channels = {};
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
@@ -764,7 +1052,7 @@ function getLightingData() {
 
 // =========== START ===========
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Server] SmartGreenHome v2 running on port ${PORT}`);
+  console.log(`[Server] خانه سبز هوشمند v2 running on port ${PORT}`);
   console.log(`[Server] Dashboard: http://0.0.0.0:${PORT}`);
 });
 

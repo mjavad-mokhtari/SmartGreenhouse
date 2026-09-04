@@ -5,11 +5,12 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <ArduinoJson.h>
 
 struct SyncEvent {
   uint32_t id;
-  const char* type;
-  const char* state;
+  String type;
+  String state;
   uint32_t ts;
 };
 
@@ -27,6 +28,8 @@ inline uint32_t _syncLastAttempt = 0;
 inline uint32_t _syncBackoffMs = 30000;
 static const uint32_t SYNC_MAX_BACKOFF_MS = 900000; // 15 min
 inline bool _syncForceNow = false;
+
+// Remote command polling
 
 inline void syncLoadConfig() {
   _syncPrefs.begin("sync", false);
@@ -86,7 +89,7 @@ inline String apiKeySummary() {
 inline bool serverOnlineFlag() { return _serverOnline; }
 inline size_t pendingCount() { return _syncCount; }
 
-inline void queueEvent(const char* type, const char* state) {
+inline void queueEvent(const String& type, const String& state) {
   size_t idx = (_syncHead + _syncCount) % SYNC_RING_SIZE;
   if (_syncCount == SYNC_RING_SIZE) {
     _syncHead = (_syncHead + 1) % SYNC_RING_SIZE;
@@ -97,6 +100,10 @@ inline void queueEvent(const char* type, const char* state) {
   _syncEvents[idx].type = type;
   _syncEvents[idx].state = state;
   _syncEvents[idx].ts = millis();
+}
+
+inline void queueEvent(const char* type, const char* state) {
+  queueEvent(String(type), String(state));
 }
 
 inline void syncTriggerNow() {
@@ -130,56 +137,115 @@ inline String eventsJson() {
   return j;
 }
 
-inline void syncLoop() {
+inline bool pollServerCommands(String& outJson, uint32_t timeoutMs = 2500) {
+  if (!_srvEnabled || WiFi.status() != WL_CONNECTED || _srvUrl.length() == 0) {
+    return false;
+  }
+
+  HTTPClient http;
+  String commandUrl = _srvUrl;
+  if (!commandUrl.endsWith("/")) commandUrl += "/";
+  commandUrl += "api/commands?device=esp32-smarthome";
+
+  http.begin(commandUrl);
+  String key = getApiKey();
+  if (key.length() > 0) {
+    http.addHeader("X-API-Key", key);
+  }
+  http.setTimeout(timeoutMs);
+  int code = http.GET();
+
+  if (code < 200 || code >= 300) {
+    http.end();
+    return false;
+  }
+
+  outJson = http.getString();
+  http.end();
+  return true;
+}
+
+inline bool ackServerCommands(const String& idsJsonArray) {
+  if (!_srvEnabled || WiFi.status() != WL_CONNECTED || _srvUrl.length() == 0) {
+    return false;
+  }
+
+  HTTPClient http;
+  String ackUrl = _srvUrl;
+  if (!ackUrl.endsWith("/")) ackUrl += "/";
+  ackUrl += "api/commands/ack";
+
+  http.begin(ackUrl);
+  String key = getApiKey();
+  if (key.length() > 0) {
+    http.addHeader("X-API-Key", key);
+  }
+  http.addHeader("Content-Type", "application/json");
+  String payload = "{\"deviceId\":\"esp32-smarthome\",\"ids\":" + idsJsonArray + "}";
+  int code = http.POST(payload);
+  http.end();
+  return (code >= 200 && code < 300);
+}
+
+inline void syncLoop(const String& statusJson = String()) {
   if (!_srvEnabled || WiFi.status() != WL_CONNECTED || _srvUrl.length() == 0) {
     _serverOnline = false;
     return;
   }
+
+  // First, sync local ring buffer events.
   uint32_t now = millis();
-  if (!_syncForceNow && (now - _syncLastAttempt < _syncBackoffMs)) {
-    return;
-  }
-  _syncForceNow = false;
-  _syncLastAttempt = now;
+  if (_syncForceNow || (now - _syncLastAttempt >= _syncBackoffMs)) {
+    _syncForceNow = false;
+    _syncLastAttempt = now;
 
-  HTTPClient http;
-  String fullUrl = _srvUrl;
-  if (!fullUrl.endsWith("/")) fullUrl += "/";
-  fullUrl += "api/events";
+    HTTPClient http;
+    String fullUrl = _srvUrl;
+    if (!fullUrl.endsWith("/")) fullUrl += "/";
+    fullUrl += "api/events";
 
-  http.begin(fullUrl);
-  http.setTimeout(3000);
-  http.addHeader("Content-Type", "application/json");
+    http.begin(fullUrl);
+    http.setTimeout(3000);
+    http.addHeader("Content-Type", "application/json");
+    String key = getApiKey();
+    if (key.length() > 0) http.addHeader("X-API-Key", key);
 
-  String payload = "{";
-  payload += "\"deviceId\":\"esp32-smarthome\",";
-  payload += "\"uptime\":" + String(millis()) + ",";
-  payload += "\"pending\":" + String(_syncCount) + ",";
-  payload += "\"events\":[";
-  for (size_t i = 0; i < _syncCount; i++) {
-    size_t idx = (_syncHead + i) % SYNC_RING_SIZE;
-    if (i > 0) payload += ",";
-    payload += "{\"id\":" + String(_syncEvents[idx].id) + ",";
-    payload += "\"type\":\"" + String(_syncEvents[idx].type) + "\",";
-    payload += "\"state\":\"" + String(_syncEvents[idx].state) + "\",";
-    payload += "\"ts\":" + String(_syncEvents[idx].ts) + "}";
-  }
-  payload += "]}";
-
-  int code = http.POST(payload);
-  if (code >= 200 && code < 300) {
-    _serverOnline = true;
-    _syncHead = 0;
-    _syncCount = 0;
-    _syncBackoffMs = 30000;
-  } else {
-    _serverOnline = false;
-    if (_syncBackoffMs < SYNC_MAX_BACKOFF_MS) {
-      _syncBackoffMs *= 2;
-      if (_syncBackoffMs > SYNC_MAX_BACKOFF_MS) _syncBackoffMs = SYNC_MAX_BACKOFF_MS;
+    String payload = "{";
+    payload += "\"deviceId\":\"esp32-smarthome\",";
+    payload += "\"serverTime\":" + String(millis()) + ",";
+    payload += "\"uptime\":" + String(millis()) + ",";
+    payload += "\"pending\":" + String(_syncCount) + ",";
+    if (statusJson.length() > 0) {
+      payload += "\"status\":";
+      payload += statusJson;
+      payload += ",";
     }
+    payload += "\"events\":[";
+    for (size_t i = 0; i < _syncCount; i++) {
+      size_t idx = (_syncHead + i) % SYNC_RING_SIZE;
+      if (i > 0) payload += ",";
+      payload += "{\"id\":" + String(_syncEvents[idx].id) + ",";
+      payload += "\"type\":\"" + String(_syncEvents[idx].type) + "\",";
+      payload += "\"state\":\"" + String(_syncEvents[idx].state) + "\",";
+      payload += "\"ts\":" + String(_syncEvents[idx].ts) + "}";
+    }
+    payload += "]}";
+
+    int code = http.POST(payload);
+    if (code >= 200 && code < 300) {
+      _serverOnline = true;
+      _syncHead = 0;
+      _syncCount = 0;
+      _syncBackoffMs = 30000;
+    } else {
+      _serverOnline = false;
+      if (_syncBackoffMs < SYNC_MAX_BACKOFF_MS) {
+        _syncBackoffMs *= 2;
+        if (_syncBackoffMs > SYNC_MAX_BACKOFF_MS) _syncBackoffMs = SYNC_MAX_BACKOFF_MS;
+      }
+    }
+    http.end();
   }
-  http.end();
 }
 
 #endif // SYNC_H
