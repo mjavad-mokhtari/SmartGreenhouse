@@ -63,6 +63,7 @@ private:
   void handleConfigTime(AsyncWebServerRequest* request);
   void handleLogs(AsyncWebServerRequest* request);
   void handleConfigWifi(AsyncWebServerRequest* request);
+  void handleConfigSync(AsyncWebServerRequest* request);
 
   String buildStatusJson();
   String buildFullDashboard();

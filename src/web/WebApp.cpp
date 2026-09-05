@@ -67,6 +67,14 @@ String WebApp::buildStatusJson() {
     lighting.appendStatus(doc.as<JsonObject>());
 #endif
 
+  JsonObject sc = doc.createNestedObject("sync");
+  sc["url"] = getServerUrl();
+  sc["enabled"] = getServerEnabled();
+  sc["online"] = serverOnlineFlag();
+  sc["pending"] = pendingCount();
+  sc["deviceId"] = getDeviceId();
+  sc["device_id"] = getDeviceId();
+
   String out;
   serializeJson(doc, out);
   return out;
@@ -212,6 +220,28 @@ void WebApp::handleConfigWifi(AsyncWebServerRequest* request) {
   } else {
     sendJson(request, "{\"ok\":false}", 400);
   }
+}
+
+void WebApp::handleConfigSync(AsyncWebServerRequest* request) {
+  String url = request->hasParam("url", true) ? request->getParam("url", true)->value() : request->arg("url");
+  String apiKey = request->hasParam("key", true) ? request->getParam("key", true)->value() : request->arg("key");
+  String devId = request->hasParam("devid", true) ? request->getParam("devid", true)->value() : request->arg("devid");
+  
+  if (url.length() > 0) {
+    setServerUrl(url);
+    setServerEnabled(true);
+    queueEvent("config", "sync-url-set");
+  }
+  if (apiKey.length() > 0) {
+    setApiKey(apiKey);
+    queueEvent("config", "api-key-set");
+  }
+  if (devId.length() > 0) {
+    setDeviceId(devId);
+    queueEvent("config", "device-id-set");
+  }
+  syncTriggerNow();
+  sendJson(request, "{\"ok\":true}");
 }
 
 // =========== DASHBOARD : Mobile-first, DOM-patch refresh ===========
@@ -473,8 +503,14 @@ function renderSettings(){
     '<input id="az-id" type="number" value="1" min="1" max="4" style="width:44px" placeholder="ID">'+
     '<input id="az-pin" type="number" value="26" min="0" max="39" style="width:54px" placeholder="GPIO">'+
     '<button class="bt bt-o" onclick="addZone()">Add</button></div></div>'+
-    '<div class="set"><h3>Sync</h3><div class="fr">'+
-    '<button class="bt bt-o" onclick="api(\'sync/now\')">Force Sync Now</button></div></div>';
+    '<div class="set"><h3>Server Sync</h3>'+
+    '<div class="fr" style="margin-bottom:6px"><input id="sync-url" placeholder="Server URL" style="flex:1;font-size:.78rem" value="'+getSyncUrl()+'"></div>'+
+    '<div class="fr" style="margin-bottom:6px"><input id="sync-key" placeholder="API Key" style="flex:1;font-size:.78rem" value="'+getSyncKey()+'"></div>'+
+    '<div class="fr" style="margin-bottom:6px"><input id="sync-devid" placeholder="Device ID" style="flex:1;font-size:.78rem" value="'+getSyncDevId()+'"></div>'+
+    '<div style="font-size:.7rem;color:var(--muted);margin-bottom:6px">Status: '+getSyncStatus()+'</div>'+
+    '<div class="fr">'+
+    '<button class="bt bt-g" onclick="saveSync()">Save &amp; Connect</button>'+
+    '<button class="bt bt-o" onclick="api(\'sync/now\')">Test Sync</button></div></div>'+
 }
 
 // --- Actions (no page refresh) ---
@@ -508,6 +544,26 @@ function addZone(){
   const id=document.getElementById('az-id').value;
   const pin=document.getElementById('az-pin').value;
   api('zone/add?id='+id+'&pin='+pin);
+
+// --- Sync helpers ---
+function getSyncUrl(){ return st&&st.sync?st.sync.url||'':'' }
+function getSyncKey(){ return st&&st.sync?st.sync.apiKey||'':'' }
+function getSyncDevId(){ return st&&st.sync?(st.sync.deviceId||st.sync.device_id||''):'' }
+function getSyncStatus(){ 
+  var sy=st&&st.sync?st.sync:null;
+  if(!sy||!sy.enabled)return 'Not configured';
+  return (sy.online?'Connected':'Offline')+' | Pending: '+(sy.pending||0);
+}
+function saveSync(){
+  var u=document.getElementById('sync-url').value.trim();
+  var k=document.getElementById('sync-key').value.trim();
+  var d=document.getElementById('sync-devid').value.trim();
+  var body='url='+encodeURIComponent(u)+'&key='+encodeURIComponent(k)+'&devid='+encodeURIComponent(d);
+  fetch('/api/config/sync',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
+    .then(function(r){return r.json()}).then(function(j){
+      if(j.ok){refresh();}
+    });
+  if(document.activeElement)document.activeElement.blur();
 }
 
 // --- Tab switching ---
@@ -540,6 +596,7 @@ void WebApp::begin() {
   server.on("/health", HTTP_GET, [this](AsyncWebServerRequest* r) { handleHealth(r); });
   server.on("/api/config/time", HTTP_POST, [this](AsyncWebServerRequest* r) { handleConfigTime(r); });
   server.on("/api/config/wifi", HTTP_POST, [this](AsyncWebServerRequest* r) { handleConfigWifi(r); });
+  server.on("/api/config/sync", HTTP_POST, [this](AsyncWebServerRequest* r) { handleConfigSync(r); });
 
 #ifdef MODULE_IRRIGATION
   auto zoneon = [this](AsyncWebServerRequest* r) { handleZoneOn(r); };
