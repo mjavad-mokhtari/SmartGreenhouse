@@ -24,7 +24,7 @@ void WebApp::sendJson(AsyncWebServerRequest* request, const String& body, int co
 }
 
 String WebApp::buildStatusJson() {
-  DynamicJsonDocument doc(1024);
+  DynamicJsonDocument doc(2048);
   DateTime now = rtc.now();
   char timeBuf[20];
   snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02d %02d:%02d:%02d",
@@ -544,6 +544,7 @@ function addZone(){
   const id=document.getElementById('az-id').value;
   const pin=document.getElementById('az-pin').value;
   api('zone/add?id='+id+'&pin='+pin);
+}
 
 // --- Sync helpers ---
 function getSyncUrl(){ return (st&&st.sync)?(st.sync.url||''):'' }
@@ -551,8 +552,8 @@ function getSyncKey(){ return (st&&st.sync)?(st.sync.apiKey||''):'' }
 function getSyncDevId(){ return (st&&st.sync)?(st.sync.deviceId||st.sync.device_id||''):'' }
 function getSyncStatus(){ 
   if(!st||!st.sync)return 'Not configured';
-  var sy=st&&st.sync?st.sync:null;
-  if(!sy||!sy.enabled)return 'Not configured';
+  var sy=st.sync;
+  if(!sy.enabled)return 'Not configured';
   return (sy.online?'Connected':'Offline')+' | Pending: '+(sy.pending||0);
 }
 function saveSync(){
