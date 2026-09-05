@@ -510,7 +510,7 @@ function renderSettings(){
     '<div style="font-size:.7rem;color:var(--muted);margin-bottom:6px">Status: '+getSyncStatus()+'</div>'+
     '<div class="fr">'+
     '<button class="bt bt-g" onclick="saveSync()">Save &amp; Connect</button>'+
-    '<button class="bt bt-o" onclick="api(\'sync/now\')">Test Sync</button></div></div>'+
+    '<button class="bt bt-o" onclick="api(\'sync/now\')">Test Sync</button></div></div>'
 }
 
 // --- Actions (no page refresh) ---
@@ -546,10 +546,11 @@ function addZone(){
   api('zone/add?id='+id+'&pin='+pin);
 
 // --- Sync helpers ---
-function getSyncUrl(){ return st&&st.sync?st.sync.url||'':'' }
-function getSyncKey(){ return st&&st.sync?st.sync.apiKey||'':'' }
-function getSyncDevId(){ return st&&st.sync?(st.sync.deviceId||st.sync.device_id||''):'' }
+function getSyncUrl(){ return (st&&st.sync)?(st.sync.url||''):'' }
+function getSyncKey(){ return (st&&st.sync)?(st.sync.apiKey||''):'' }
+function getSyncDevId(){ return (st&&st.sync)?(st.sync.deviceId||st.sync.device_id||''):'' }
 function getSyncStatus(){ 
+  if(!st||!st.sync)return 'Not configured';
   var sy=st&&st.sync?st.sync:null;
   if(!sy||!sy.enabled)return 'Not configured';
   return (sy.online?'Connected':'Offline')+' | Pending: '+(sy.pending||0);
