@@ -369,6 +369,7 @@ function refresh(){
     renderInsights(s);
     renderIrrigation(s);
     renderLighting(s);
+    if(page==='settings')renderSettings();
   }).catch(()=>{});
   fetch('/api/logs').then(r=>r.json()).then(l=>renderLogs(l)).catch(()=>{});
 }
@@ -487,6 +488,8 @@ function renderLogs(l){
 
 // --- Settings page (static with live inputs) ---
 function renderSettings(){
+  var sy=st&&st.sync?st.sync:null;
+  var syncLine=sy?('Status: '+(sy.enabled?(sy.online?'Connected':'Offline'):'Disabled')+' | HTTP: '+(sy.httpCode||0)+' | Result: '+(sy.result||'idle')+' | Pending: '+(sy.pending||0)):'Status: Not configured';
   $('pg-settings').innerHTML=
     '<div class="set"><h3>Wi-Fi Setup</h3><div class="fr">'+
     '<input id="ssid-in" placeholder="SSID" style="flex:1">'+
@@ -507,10 +510,10 @@ function renderSettings(){
     '<div class="fr" style="margin-bottom:6px"><input id="sync-url" placeholder="Server URL" style="flex:1;font-size:.78rem" value="'+getSyncUrl()+'"></div>'+
     '<div class="fr" style="margin-bottom:6px"><input id="sync-key" placeholder="API Key" style="flex:1;font-size:.78rem" value="'+getSyncKey()+'"></div>'+
     '<div class="fr" style="margin-bottom:6px"><input id="sync-devid" placeholder="Device ID" style="flex:1;font-size:.78rem" value="'+getSyncDevId()+'"></div>'+
-    '<div style="font-size:.7rem;color:var(--muted);margin-bottom:6px">Status: '+getSyncStatus()+'</div>'+
+    '<div id="sync-feedback" style="font-size:.7rem;color:var(--muted);margin-bottom:6px">'+syncLine+'</div>'+
     '<div class="fr">'+
     '<button class="bt bt-g" onclick="saveSync()">Save &amp; Connect</button>'+
-    '<button class="bt bt-o" onclick="api(\'sync/now\')">Test Sync</button></div></div>'
+    '<button class="bt bt-o" onclick="testSync()">Test Sync</button></div></div>'
 }
 
 // --- Actions (no page refresh) ---
@@ -561,11 +564,26 @@ function saveSync(){
   var k=document.getElementById('sync-key').value.trim();
   var d=document.getElementById('sync-devid').value.trim();
   var body='url='+encodeURIComponent(u)+'&key='+encodeURIComponent(k)+'&devid='+encodeURIComponent(d);
+  var feedback=$('sync-feedback');
+  if(feedback)feedback.textContent='Saving...';
   fetch('/api/config/sync',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
     .then(function(r){return r.json()}).then(function(j){
+      if(feedback)feedback.textContent=j.ok?'Saved. Sync queued.':'Save failed';
       if(j.ok){refresh();}
+    }).catch(function(){
+      if(feedback)feedback.textContent='Save failed';
     });
   if(document.activeElement)document.activeElement.blur();
+}
+function testSync(){
+  var feedback=$('sync-feedback');
+  if(feedback)feedback.textContent='Sync requested...';
+  fetch('/api/sync/now',{method:'POST'}).then(function(r){return r.json()}).then(function(j){
+    if(feedback)feedback.textContent=j.ok?'Sync queued. Wait for next status refresh.':'Sync request failed';
+    refresh();
+  }).catch(function(){
+    if(feedback)feedback.textContent='Sync request failed';
+  });
 }
 
 // --- Tab switching ---
@@ -627,7 +645,7 @@ void WebApp::begin() {
   // Sync endpoint
   server.on("/api/sync/now", HTTP_POST, [this](AsyncWebServerRequest* r) {
     syncTriggerNow();
-    sendJson(r, "{\"ok\":true}");
+    sendJson(r, "{\"ok\":true,\"message\":\"sync queued\"}");
   });
 
   server.begin();

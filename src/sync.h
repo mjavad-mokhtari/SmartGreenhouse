@@ -24,6 +24,8 @@ inline Preferences _syncPrefs;
 inline String _srvUrl = "";
 inline bool _srvEnabled = false;
 inline bool _serverOnline = false;
+inline int _syncLastHttpCode = 0;
+inline String _syncLastResult = "idle";
 inline uint32_t _syncLastAttempt = 0;
 inline uint32_t _syncBackoffMs = 30000;
 static const uint32_t SYNC_MAX_BACKOFF_MS = 900000; // 15 min
@@ -133,6 +135,8 @@ inline String syncStatusJson() {
   out += "\"enabled\":" + String(_srvEnabled ? "true" : "false") + ",";
   out += "\"online\":" + String(_serverOnline ? "true" : "false") + ",";
   out += "\"pending\":" + String(_syncCount) + ",";
+  out += "\"httpCode\":" + String(_syncLastHttpCode) + ",";
+  out += "\"result\":\"" + _syncLastResult + "\",";
   out += "\"backoffMs\":" + String(_syncBackoffMs);
   out += "}}";
   return out;
@@ -248,13 +252,22 @@ inline void syncLoop(const String& statusJson = String()) {
     payload += "]}";
 
     int code = http.POST(payload);
+    _syncLastHttpCode = code;
+    bool accepted = false;
     if (code >= 200 && code < 300) {
+      DynamicJsonDocument reply(512);
+      DeserializationError parseErr = deserializeJson(reply, http.getString());
+      accepted = !parseErr && reply["ok"].as<bool>();
+    }
+    if (accepted) {
       _serverOnline = true;
+      _syncLastResult = "accepted";
       _syncHead = 0;
       _syncCount = 0;
       _syncBackoffMs = 30000;
     } else {
       _serverOnline = false;
+      _syncLastResult = (code >= 200 && code < 300) ? "invalid-response" : "http-error";
       if (_syncBackoffMs < SYNC_MAX_BACKOFF_MS) {
         _syncBackoffMs *= 2;
         if (_syncBackoffMs > SYNC_MAX_BACKOFF_MS) _syncBackoffMs = SYNC_MAX_BACKOFF_MS;

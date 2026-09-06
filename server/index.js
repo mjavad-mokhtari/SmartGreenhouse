@@ -319,6 +319,16 @@ app.post('/api/events', (req, res) => {
   if (!req.body) return res.status(400).json({ error: 'invalid json' });
   const { deviceId, uptime, events: evts, status: devStatus } = req.body;
   if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  if (!Array.isArray(evts) || evts.length === 0) {
+    deviceStates[deviceId] = {
+      lastSeen: Date.now(),
+      uptime: uptime || 0,
+      ip: req.ip,
+      status: devStatus && typeof devStatus === 'object' ? devStatus : (devStatus || {})
+    };
+    saveDevices();
+    return res.json({ ok: true, received: 0, note: 'no-events' });
+  }
   deviceStates[deviceId] = {
     lastSeen: Date.now(),
     uptime: uptime || 0,
