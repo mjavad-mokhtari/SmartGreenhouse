@@ -162,6 +162,14 @@ function requireControl(req, res, next) {
   return requireApiKey(req, res, next);
 }
 
+function recoveryFallbackPage(msg = '') {
+  return `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی</title><style>body{background:#0b0e11;color:#e4e6ea;font:14px system-ui;display:flex;justify-content:center;align-items:center;min-height:100dvh;margin:0}.box{background:#15191e;border:1px solid #1f2937;border-radius:12px;padding:20px;width:100%;max-width:360px;text-align:center}.box h2{color:#ef4444;margin:0 0 8px}.box p{font-size:.8rem;color:#6b7280;margin:4px 0 12px}</style></head><body><div class="box"><h2>⚠️ ${msg || 'بازیابی ۲FA'}</h2><p>در صورت عدم نمایش QR، با دستور زیر در ترمینال مسیر بازیابی را بررسی کنید.</p></div></body></html>`;
+}
+
+function resolveRecoverPage(msg = '') {
+  return recoveryFallbackPage(msg);
+}
+
 function nowTs() { return Date.now(); }
 
 function pickDeviceId(requestedId = '') {
@@ -270,26 +278,26 @@ app.post('/setup', async (req, res) => {
 app.get('/emergency-qr', async (req, res) => {
   if (!users.length) return res.redirect('/setup');
   const user = users[0];
-  if (!user.totpSecret || !user.totpEnabled) return res.type('html').send(recoverPage('2FA برای این کاربر فعال نیست'));
+  if (!user.totpSecret || !user.totpEnabled) return res.type('html').send(resolveRecoverPage('2FA برای این کاربر فعال نیست'));
   try {
     const otpauth = otplib.authenticator.keyuri(user.username, 'خانه سبز هوشمند', user.totpSecret);
     const qrDataUrl = await QRCode.toDataURL(otpauth, { width: 250 });
     res.type('html').send(setupDonePage(qrDataUrl, user.totpSecret));
-  } catch(e) { res.type('html').send(recoverPage('خطا در تولید QR')); }
+  } catch(e) { res.type('html').send(resolveRecoverPage('خطا در تولید QR')); }
 });
 
 app.get('/recover-2fa', (req, res) => {
   if (!users.length) return res.redirect('/setup');
   const user = users[0];
-  if (!user.totpSecret || !user.totpEnabled) return res.type('html').send(recoverPage('2FA برای این کاربر فعال نیست'));
+  if (!user.totpSecret || !user.totpEnabled) return res.type('html').send(resolveRecoverPage('2FA برای این کاربر فعال نیست'));
   try {
     const otpauth = otplib.authenticator.keyuri(user.username, 'خانه سبز هوشمند', user.totpSecret);
     QRCode.toDataURL(otpauth, { width: 250 }).then(qrDataUrl => {
       res.type('html').send(setupDonePage(qrDataUrl, user.totpSecret));
     }).catch(err => {
-      res.type('html').send(recoverPage('خطا در تولید QR: ' + err.message));
+      res.type('html').send(resolveRecoverPage('خطا در تولید QR: ' + err.message));
     });
-  } catch(e) { res.type('html').send(recoverPage('خطا: ' + e.message)); }
+  } catch(e) { res.type('html').send(resolveRecoverPage('خطا: ' + e.message)); }
 });
 
 // Emergency password reset — bypass 2FA, set new password
@@ -531,7 +539,7 @@ app.get('/api/status-full', (req, res) => {
   res.json({
     devices: Object.keys(deviceStates),
     deviceInfo,
-    allEvents: events,
+    allEvents: events.slice(-120),
     timeline: getTimelineData(),
     stats: getStats(),
     pendingCommands: Object.fromEntries(Object.keys(commands).map((id) => [id, (commands[id] || []).length]))
@@ -820,12 +828,12 @@ function renderIrrigation(){
   var d=st&&st.deviceInfo?st.deviceInfo[did]:null,irr=d&&d.irrigation?d.irrigation:null;
   if(!irr||!irr.zones){$('pg-irrigation').innerHTML='<div class="card"><div class="ct">ماژول آبیاری فعال نیست</div></div>';return}
   var h='';
-  h+='<div class="card"><div class="ch"><span class="ct">⛽ پمپ • GPIO '+irr.pumpGpio+'</span><span class="stg '+(irr.pumpOn?'run':'off')+'">'+(irr.pumpOn?'فعال':'خاموش')+'</span></div><div class="fr"><button class="bt g" onclick="act(\'pump/on\')">روشن</button><button class="bt r" onclick="act(\'pump/off\')">خاموش</button></div></div>';
+  h+='<div class="card"><div class="ch"><span class="ct">⛽ پمپ • GPIO '+irr.pumpGpio+'</span><span class="stg '+(irr.pumpOn?'run':'off')+'">'+(irr.pumpOn?'فعال':'خاموش')+'</span></div><div class="fr"><button class="bt g" onclick="act(\\'pump/on\\')">روشن</button><button class="bt r" onclick="act(\\'pump/off\\')">خاموش</button></div></div>';
   if(irr.soilPercent!=null)h+='<div class="card"><span class="ct">🌱 سنسور رطوبت خاک</span><div style="font-size:1.5rem;font-weight:700;color:'+(irr.soilPercent<30?'var(--danger)':'var(--accent)')+'">'+irr.soilPercent+'%</div><div style="font-size:.7rem;color:var(--muted)">خام: '+irr.soilRaw+'</div></div>';
   h+='<div class="cnv-wrap"><div class="cnv-t">📊 مصرف آب ۲۴ ساعته</div><canvas class="cnv" id="cvWater" width="600" height="70"></canvas><div style="text-align:center;font-size:.65rem;color:var(--muted);margin-top:4px" id="cvLeg"></div></div>';
   var zones=irr.zones||[];
   zones.forEach(function(z){
-    h+='<div class="card"><div class="ch"><span class="ct">💧 زون '+z.id+' • GPIO'+z.pin+'</span><span class="stg '+(z.running?'run':'off')+'">'+(z.running?'فعال ('+z.remainingSec+'ث)':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">بعدی: '+(z.nextRun||'--')+' | فعال: '+(z.enabled?'بله':'خیر')+' | اجرا امروز: '+(z.ranToday?'بله':'خیر')+'</div><div class="fr"><button class="bt g sm" onclick="act(\'zone/on\',{id:'+z.id+',dur:'+(z.duration||15)+'})">روشن</button><button class="bt r sm" onclick="act(\'zone/off\',{id:'+z.id+'})">خاموش</button></div><div class="fr"><input type="time" id="st'+z.id+'" value="'+pad(z.hour)+':'+pad(z.minute)+'"><input type="number" id="sd'+z.id+'" value="'+(z.duration||15)+'" min="1" max="480"><span style="font-size:.7rem;color:var(--muted)">دقیقه</span><button class="bt b sm" onclick="setSch('+z.id+')">تنظیم</button></div></div>'
+    h+='<div class="card"><div class="ch"><span class="ct">💧 زون '+z.id+' • GPIO'+z.pin+'</span><span class="stg '+(z.running?'run':'off')+'">'+(z.running?'فعال ('+z.remainingSec+'ث)':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">بعدی: '+(z.nextRun||'--')+' | فعال: '+(z.enabled?'بله':'خیر')+' | اجرا امروز: '+(z.ranToday?'بله':'خیر')+'</div><div class="fr"><button class="bt g sm" onclick="act(\\'zone/on\\',{id:'+z.id+',dur:'+(z.duration||15)+'})">روشن</button><button class="bt r sm" onclick="act(\\'zone/off\\',{id:'+z.id+'})">خاموش</button></div><div class="fr"><input type="time" id="st'+z.id+'" value="'+pad(z.hour)+':'+pad(z.minute)+'"><input type="number" id="sd'+z.id+'" value="'+(z.duration||15)+'" min="1" max="480"><span style="font-size:.7rem;color:var(--muted)">دقیقه</span><button class="bt b sm" onclick="setSch('+z.id+')">تنظیم</button></div></div>'
   });
   $('pg-irrigation').innerHTML=h
 }
@@ -833,11 +841,11 @@ function renderLighting(){
   var d=st&&st.deviceInfo?st.deviceInfo[did]:null,lt=d&&d.lighting?d.lighting:null;
   if(!lt){$('pg-lighting').innerHTML='<div class="card"><div class="ct">ماژول نور فعال نیست</div></div>';return}
   var h='';
-  h+='<div class="card"><span class="ct">💡 کنترل کلی</span><div class="fr"><button class="bt g sm" onclick="act(\'lighting/all-on\')">همه روشن</button><button class="bt r sm" onclick="act(\'lighting/all-off\')">همه خاموش</button></div></div>';
+  h+='<div class="card"><span class="ct">💡 کنترل کلی</span><div class="fr"><button class="bt g sm" onclick="act(\\'lighting/all-on\\')">همه روشن</button><button class="bt r sm" onclick="act(\\'lighting/all-off\\')">همه خاموش</button></div></div>';
   h+='<div class="cnv-wrap"><div class="cnv-t">📊 وضعیت نور ۲۴ ساعته</div><canvas class="cnv" id="cvLight" width="600" height="70"></canvas></div>';
   var chs=lt.channels||lt.state||[];
   chs.forEach(function(c){
-    h+='<div class="card"><div class="ch"><span class="ct">کانال '+c.id+' • GPIO'+c.pin+'</span><span class="stg '+(c.state?'run':'off')+'">'+(c.state?'روشن':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">زمانبندی: '+(c.scheduleEnabled?c.onTime+' تا '+c.offTime:'غیرفعال')+'</div><button class="bt '+(c.state?'r':'g')+' sm" onclick="act(\'lighting/toggle\',{id:'+c.id+'})">تغییر وضعیت</button></div>'
+    h+='<div class="card"><div class="ch"><span class="ct">کانال '+c.id+' • GPIO'+c.pin+'</span><span class="stg '+(c.state?'run':'off')+'">'+(c.state?'روشن':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">زمانبندی: '+(c.scheduleEnabled?c.onTime+' تا '+c.offTime:'غیرفعال')+'</div><button class="bt '+(c.state?'r':'g')+' sm" onclick="act(\\'lighting/toggle\\',{id:'+c.id+'})">تغییر وضعیت</button></div>'
   });
   $('pg-lighting').innerHTML=h
 }
@@ -888,10 +896,13 @@ function toast(msg,isErr){
 }
 function act(path,params){
   var url='/api/'+path;
-  var btn=(window.event&&window.event.target)?window.event.target:null;
-  if(btn&&btn.tagName==='BUTTON'){btn.disabled=true;var origTxt=btn.textContent;btn.textContent='...'}
+  var source=(window.event&&window.event.target)?window.event.target:null;
+  var btn=source&&(source.tagName==='BUTTON')?source:(source&&source.closest?source.closest('button'):null);
+  if (btn&&btn.tagName==='BUTTON') { btn.disabled=true; var origTxt=btn.textContent; btn.textContent='...'; }
+  if(did&&params&&!params.deviceId)params.deviceId=did;
   fetch(url,{
     method:'POST',
+    credentials:'same-origin',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify(params||{})
   }).then(function(r){
