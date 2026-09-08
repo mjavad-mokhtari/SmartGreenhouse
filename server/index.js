@@ -187,13 +187,14 @@ function newCommandId() {
 
 function pushCommand(deviceId, action, params = {}) {
   const id = newCommandId();
+  const createdAt = nowTs();
   if (!commands[deviceId]) commands[deviceId] = [];
-  commands[deviceId].push({ id, action, params, createdAt: nowTs(), source: 'dashboard' });
+  commands[deviceId].push({ id, action, params, createdAt, source: 'dashboard' });
   if (commands[deviceId].length > COMMAND_POLL_LIMIT) {
     commands[deviceId] = commands[deviceId].slice(-COMMAND_POLL_LIMIT);
   }
   saveCommands();
-  return { id, action, params, createdAt: nowTs() };
+  return { id, action, params, createdAt };
 }
 
 function ackCommands(deviceId, ids = []) {
@@ -388,14 +389,25 @@ app.post('/api/zone/schedule', requireControl, (req, res) => {
   const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
   const zoneId = parseInt(req.body.id || req.query.id || req.body.zoneId || req.query.zoneId, 10);
-  const hour = parseInt(req.body.hour || req.query.hour, 10);
-  const minute = parseInt(req.body.minute || req.query.minute, 10);
+  const hour = parseInt(req.body.hour ?? req.query.hour, 10);
+  const minute = parseInt(req.body.minute ?? req.query.minute, 10);
   const dur = parseInt(req.body.dur || req.body.duration || req.query.dur || req.query.duration || req.query.min, 10);
   if (!Number.isFinite(zoneId) || zoneId <= 0) return res.status(400).json({ error: 'invalid zone id' });
   if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59)
     return res.status(400).json({ error: 'invalid schedule time' });
   if (!Number.isFinite(dur) || dur < 1 || dur > 480) return res.status(400).json({ error: 'invalid duration' });
   const command = pushCommand(deviceId, 'zone/schedule', { id: zoneId, hour, minute, dur });
+  res.json({ ok: true, command });
+});
+
+app.post('/api/zone/add', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const id = parseInt(req.body.id ?? req.query.id, 10);
+  const pin = parseInt(req.body.pin ?? req.query.pin, 10);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid zone id' });
+  if (!Number.isFinite(pin) || pin < 0 || pin > 39) return res.status(400).json({ error: 'invalid gpio' });
+  const command = pushCommand(deviceId, 'zone/add', { id, pin });
   res.json({ ok: true, command });
 });
 
@@ -487,6 +499,13 @@ app.get('/api/commands', requireApiKey, (req, res) => {
   res.json({ ok: true, deviceId, count: payload.length, commands: payload, pending: list.length });
 });
 
+app.get('/api/commands/status', requireControl, (req, res) => {
+  pruneExpiredCommands();
+  const deviceId = pickDeviceId(req.query.deviceId || req.query.device);
+  const list = deviceId ? (commands[deviceId] || []) : [];
+  res.json({ ok: true, deviceId, pending: list.length, commands: list.slice(0, COMMAND_POLL_LIMIT) });
+});
+
 // Device ACK consumed commands
 app.post('/api/commands/ack', requireApiKey, (req, res) => {
   const deviceId = req.body.deviceId || req.headers['x-device-id'] || 'esp32-irrigation';
@@ -514,7 +533,8 @@ app.get('/api/status-full', (req, res) => {
     deviceInfo,
     allEvents: events,
     timeline: getTimelineData(),
-    stats: getStats()
+    stats: getStats(),
+    pendingCommands: Object.fromEntries(Object.keys(commands).map((id) => [id, (commands[id] || []).length]))
   });
 });
 
@@ -591,6 +611,9 @@ function getTimelineData() {
 
 // Dashboard
 app.get('/', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
   res.type('html').send(dashboardPage());
 });
 
@@ -680,11 +703,14 @@ canvas.cnv{width:100%;height:70px;display:block;border-radius:6px}
 .bar{display:flex;justify-content:space-between;align-items:center;padding:4px 0;margin-top:8px;border-top:1px solid var(--border)}
 .bar span{font-size:.7rem;color:var(--muted)}
 .bar a{color:var(--danger);text-decoration:none;font-size:.7rem}
+.notice{display:none;border:1px solid #7f1d1d;background:#2a1010;color:#fecaca;border-radius:8px;padding:8px 10px;margin:8px 0;font-size:.75rem}
+.notice.on{display:block}
 @media(min-width:768px){.insights{grid-template-columns:repeat(4,1fr)}main{max-width:860px}}</style></head>
 <body><main>
 <div class="top"><h1>🏠 خانه سبز هوشمند</h1>
 <div class="ri"><select class="dsel" id="devSel"></select><span class="clk" id="clock">--:--:--</span><span class="dot g" id="dot"></span></div></div>
 <div class="insights" id="insights"></div>
+<div class="notice" id="notice"></div>
 <nav class="tabs" id="tabs">
 <button class="tab" data-pg="overview">نمای کلی</button>
 <button class="tab on" data-pg="irrigation">آبیاری</button>
@@ -700,15 +726,32 @@ canvas.cnv{width:100%;height:70px;display:block;border-radius:6px}
 <div class="bar"><span>نسخه ۲.۱</span><a href="/logout">خروج</a></div>
 </main>
 <script>
-var page='irrigation',st=null,did='',dids=[];
+var page='irrigation',st=null,did='',dids=[],lastCmdAt=0,refreshBusy=false;
+window.addEventListener('error',function(e){
+  console.error('[Dashboard error]',e.error||e.message);
+  try{toast('خطای نمایش رخ داد؛ صفحه در حال تلاش مجدد است',true)}catch(_){}
+});
+window.addEventListener('unhandledrejection',function(e){
+  console.error('[Dashboard promise error]',e.reason);
+});
 function $(id){return document.getElementById(id)}
 function pad(n){return n<10?'0'+n:''+n}
 
 function setDid(id){did=id;updateDot();refresh()}
 
 async function refresh(){
-  try{var r=await fetch('/api/status-full');st=await r.json();if(!did&&st.devices&&st.devices.length)did=st.devices[0];renderAll()}catch(e){}
+  if(refreshBusy)return;refreshBusy=true;
+  try{
+    var r=await fetch('/api/status-full',{cache:'no-store',headers:{'Accept':'application/json'}});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    st=await r.json();
+    if(!did&&st.devices&&st.devices.length)did=st.devices[0];
+    setNotice('');renderAll()
+  }catch(e){
+    console.error('[refresh]',e);setNotice('ارتباط داشبورد با API برقرار نیست: '+e.message)
+  }finally{refreshBusy=false}
 }
+function setNotice(msg){var n=$('notice');if(!n)return;n.textContent=msg||'';n.classList.toggle('on',!!msg)}
 function renderAll(){
   if(!st)return;
   var saved={};
@@ -718,10 +761,11 @@ function renderAll(){
       if(ae.id)saved[ae.id]={v:ae.value,selStart:ae.selectionStart,selEnd:ae.selectionEnd}
     }
   })();
-  renderDevSel();renderInsights();renderIrrigation();renderLighting();
-  if(page==='logs')renderLogs();
-  if(page==='overview')renderOverview();
-  drawCharts()
+  function safe(fn){try{fn()}catch(e){console.error('[render error]',fn.name,e)}}
+  safe(renderDevSel);safe(renderInsights);safe(renderIrrigation);safe(renderLighting);
+  if(page==='logs')safe(renderLogs);
+  if(page==='overview')safe(renderOverview);
+  safe(drawCharts);
 
   // restore saved input values after refresh
   (function(){
@@ -750,6 +794,7 @@ function renderInsights(){
   var actZ=0;if(irr.zones)irr.zones.forEach(function(z){if(z.running)actZ++});
   var ltOn=0;var chs=lt.channels||lt.state||[];chs.forEach(function(c){if(c.state)ltOn++});
   var soil=irr.soilPercent!=null?irr.soilPercent:'--';
+  var pending=st&&st.pendingCommands&&did?(st.pendingCommands[did]||0):0;
   var items=[
     {v:w.connected?'متصل':'قطع',l:'Wi-Fi',c:w.connected?'g':'r'},
     {v:irr.pumpOn?'روشن':'خاموش',l:'پمپ',c:irr.pumpOn?'g':'r'},
@@ -758,7 +803,8 @@ function renderInsights(){
     {v:ltOn,l:'نور روشن',c:''},
     {v:hl.freeHeapKB+' KB',l:'رم آزاد',c:''},
     {v:rt.valid?'معتبر':'نامعتبر',l:'RTC',c:rt.valid?'g':'r'},
-    {v:hl.uptimeMin+' دقیقه',l:'آپتایم',c:''}
+    {v:hl.uptimeMin+' دقیقه',l:'آپتایم',c:''},
+    {v:pending,l:'فرمان در انتظار',c:pending?'y':'g'}
   ];
   var h='';items.forEach(function(it){h+='<div class="in"><div class="nv '+it.c+'">'+it.v+'</div><div class="lb">'+it.l+'</div></div>'});
   $('insights').innerHTML=h
@@ -796,7 +842,7 @@ function renderLighting(){
   $('pg-lighting').innerHTML=h
 }
 function renderLogs(){
-  var ev=st&&st.allEvents?st.allEvents:[];var f=ev.filter(function(e){return e.device_id===did}).slice(0,60);
+  var ev=st&&st.allEvents?st.allEvents:[];var f=ev.filter(function(e){return e.device_id===did}).sort(function(a,b){return (b.received_at||b.ts)-(a.received_at||a.ts)}).slice(0,60);
   var h='<div class="logs">';
   if(!f.length)h+='<div style="color:var(--muted)">رویدادی ثبت نشده</div>';
   f.forEach(function(e){
@@ -830,10 +876,39 @@ async function uploadFW(){
   try{var r=await fetch('/api/firmware',{method:'POST',body:fd}),j=await r.json();$('fwStatus').textContent='آپلود شد: '+j.file}catch(e){$('fwStatus').textContent='خطا در آپلود'}
 }
 
+function toast(msg,isErr){
+  var t=$('toast');
+  if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:999;padding:9px 16px;border-radius:8px;font-size:.78rem;font-weight:600;max-width:90%;text-align:center;transition:opacity .3s';document.body.appendChild(t)}
+  t.textContent=msg;
+  t.style.background=isErr?'#7f1d1d':'#065f46';
+  t.style.color=isErr?'#fecaca':'#a7f3d0';
+  t.style.opacity='1';
+  clearTimeout(t._h);
+  t._h=setTimeout(function(){t.style.opacity='0'},2600);
+}
 function act(path,params){
   var url='/api/'+path;
-  if(params){url+='?'+Object.entries(params).map(function(e){return e[0]+'='+encodeURIComponent(e[1])}).join('&')}
-  fetch(url,{method:'POST'}).then(function(r){return r.json()}).then(function(j){if(j.ok)refresh()}).catch(function(){})
+  var btn=(window.event&&window.event.target)?window.event.target:null;
+  if(btn&&btn.tagName==='BUTTON'){btn.disabled=true;var origTxt=btn.textContent;btn.textContent='...'}
+  fetch(url,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(params||{})
+  }).then(function(r){
+    return r.json().catch(function(){return {}}).then(function(j){return {status:r.status,ok:r.ok,body:j}});
+  }).then(function(res){
+    if(btn&&btn.tagName==='BUTTON'){btn.disabled=false;btn.textContent=origTxt}
+    if(res.ok&&res.body&&res.body.ok){
+      toast('✓ فرمان ثبت شد'+(res.body.command?('؛ در انتظار دریافت برد'):''));
+      lastCmdAt=Date.now();
+      refresh();
+    } else {
+      toast('✗ خطا: '+(res.body&&res.body.error?res.body.error:('HTTP '+res.status)),true);
+    }
+  }).catch(function(e){
+    if(btn&&btn.tagName==='BUTTON'){btn.disabled=false;btn.textContent=origTxt}
+    toast('✗ ارتباط با سرور برقرار نشد',true);
+  });
 }
 
 function drawCharts(){
@@ -878,15 +953,18 @@ function drawLightTimeline(){
   var cols=['#f59e0b','#3b82f6','#10b981','#a78bfa'];chs.forEach(function(c,i){var y=8+i*15;ctx.fillStyle=cols[i%cols.length];ctx.fillRect(4,y,8,8);ctx.fillText('Ch'+c.id+(c.state?' ON':' OFF'),16,y+8);ctx.fillStyle='#e4e6ea';ctx.font='8px sans-serif';ctx.textAlign='left'})
 }
 
-$('tabs').addEventListener('click',function(e){
-  var tb=e.target.closest('.tab');if(!tb)return;
-  page=tb.dataset.pg;
-  document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('on',t===tb)});
+function selectPage(next,tb){
+  page=next;
+  document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('on',tb?t===tb:t.dataset.pg===page)});
   document.querySelectorAll('[id^="pg-"]').forEach(function(p){p.classList.toggle('hidden',p.id!=='pg-'+page)});
   if(page==='settings')renderSettings();
-  if(page==='overview')renderOverview();
-  if(page==='logs')renderLogs();
-  refresh()
+  if(st&&page==='overview')renderOverview();
+  if(st&&page==='logs')renderLogs();
+  if(st)drawCharts();
+}
+$('tabs').addEventListener('click',function(e){
+  var tb=e.target.closest('.tab');if(!tb)return;
+  selectPage(tb.dataset.pg,tb);refresh()
 });
 
 $('devSel').addEventListener('change',function(){setDid(this.value)});
