@@ -4,8 +4,66 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+
+static const char SGH_LE_ROOT_CA[] PROGMEM = R"SGHCA(-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)SGHCA";
+
+inline bool beginServerRequest(HTTPClient& http, WiFiClientSecure& tlsClient, const String& url) {
+  if (url.startsWith("https://")) {
+    tlsClient.setCACert(SGH_LE_ROOT_CA);
+    return http.begin(tlsClient, url);
+  }
+  return http.begin(url);
+}
+
+// Validate HTTPS before replacing the working server URL. This keeps a bad
+// certificate, DNS result, or device clock from stranding remote management.
+inline bool probeServerUrl(const String& baseUrl) {
+  if (!baseUrl.startsWith("https://") || WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  WiFiClientSecure tlsClient;
+  String healthUrl = baseUrl;
+  if (!healthUrl.endsWith("/")) healthUrl += "/";
+  healthUrl += "api/health";
+  if (!beginServerRequest(http, tlsClient, healthUrl)) return false;
+  http.setTimeout(3500);
+  const int code = http.GET();
+  http.end();
+  return code >= 200 && code < 300;
+}
 
 struct SyncEvent {
   uint32_t id;
@@ -157,17 +215,18 @@ inline String eventsJson() {
   return j;
 }
 
-inline bool pollServerCommands(String& outJson, uint32_t timeoutMs = 2500) {
+inline bool pollServerCommands(String& outJson, uint32_t timeoutMs = 1200) {
   if (!_srvEnabled || WiFi.status() != WL_CONNECTED || _srvUrl.length() == 0) {
     return false;
   }
 
   HTTPClient http;
+  WiFiClientSecure tlsClient;
   String commandUrl = _srvUrl;
   if (!commandUrl.endsWith("/")) commandUrl += "/";
   commandUrl += "api/commands?device=" + _deviceId;
 
-  http.begin(commandUrl);
+  if (!beginServerRequest(http, tlsClient, commandUrl)) return false;
   String key = getApiKey();
   if (key.length() > 0) {
     http.addHeader("X-API-Key", key);
@@ -185,23 +244,33 @@ inline bool pollServerCommands(String& outJson, uint32_t timeoutMs = 2500) {
   return true;
 }
 
-inline bool ackServerCommands(const String& idsJsonArray) {
+inline bool ackServerCommand(const String& commandId, const String& status, const String& detail) {
   if (!_srvEnabled || WiFi.status() != WL_CONNECTED || _srvUrl.length() == 0) {
     return false;
   }
 
   HTTPClient http;
+  WiFiClientSecure tlsClient;
   String ackUrl = _srvUrl;
   if (!ackUrl.endsWith("/")) ackUrl += "/";
   ackUrl += "api/commands/ack";
 
-  http.begin(ackUrl);
+  if (!beginServerRequest(http, tlsClient, ackUrl)) return false;
+  http.setTimeout(1200);
   String key = getApiKey();
   if (key.length() > 0) {
     http.addHeader("X-API-Key", key);
   }
   http.addHeader("Content-Type", "application/json");
-  String payload = "{\"deviceId\":\"" + _deviceId + "\",\"ids\":" + idsJsonArray + "}";
+  StaticJsonDocument<384> doc;
+  doc["deviceId"] = _deviceId;
+  JsonArray results = doc.createNestedArray("results");
+  JsonObject result = results.createNestedObject();
+  result["id"] = commandId;
+  result["status"] = status;
+  result["detail"] = detail;
+  String payload;
+  serializeJson(doc, payload);
   int code = http.POST(payload);
   http.end();
   return (code >= 200 && code < 300);
@@ -220,11 +289,17 @@ inline void syncLoop(const String& statusJson = String()) {
     _syncLastAttempt = now;
 
     HTTPClient http;
+    WiFiClientSecure tlsClient;
     String fullUrl = _srvUrl;
     if (!fullUrl.endsWith("/")) fullUrl += "/";
     fullUrl += "api/events";
 
-    http.begin(fullUrl);
+    if (!beginServerRequest(http, tlsClient, fullUrl)) {
+      _serverOnline = false;
+      _syncLastHttpCode = -1;
+      _syncLastResult = "invalid-server-url";
+      return;
+    }
     http.setTimeout(3000);
     http.addHeader("Content-Type", "application/json");
     String key = getApiKey();

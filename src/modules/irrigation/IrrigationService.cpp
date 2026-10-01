@@ -162,7 +162,7 @@ bool IrrigationService::start(int idx, uint16_t durationMin, const char* reason)
 bool IrrigationService::stop(int idx, const char* reason) {
   if (idx < 0 || idx >= (int)zoneN) return false;
   Zone& z = zones[idx];
-  if (!z.running) return false;
+  if (!z.running) return true;
   z.running = false;
   z.started = 0;
   zoneWrite(z.pin, false);

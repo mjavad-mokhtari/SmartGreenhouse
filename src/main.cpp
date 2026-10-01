@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <esp_system.h>
+#include <sys/time.h>
 #include <ArduinoOTA.h>
 #include "core/Services.h"
 #ifdef MODULE_IRRIGATION
@@ -35,11 +36,21 @@ WebApp webApp(rtc, wifi
 #endif
 );
 
+static void syncSystemClockFromRtc() {
+  if (!rtc.isAvailable()) return;
+  const DateTime now = rtc.now();
+  if (now.year() < 2020) return;
+  timeval tv{};
+  tv.tv_sec = now.unixtime();
+  settimeofday(&tv, nullptr);
+}
+
 void setup() {
   Serial.begin(115200);
 
   led.begin();
   rtc.begin();
+  syncSystemClockFromRtc();
 
 #ifdef MODULE_IRRIGATION
   irrigation.begin();
@@ -254,26 +265,54 @@ String buildServerStatusJson() {
 }
 
 // --- Remote server command executor ---
-void applyRemoteCommand(const String& action, JsonObject params, const String& commandId, String& ackedIdsCsv, size_t& ackCount) {
+String remoteCommandDoneIds() {
+  Preferences prefs;
+  prefs.begin("cmdids", true);
+  String ids = prefs.getString("done", "|");
+  prefs.end();
+  return ids;
+}
+
+bool remoteCommandWasApplied(const String& commandId) {
+  const String ids = remoteCommandDoneIds();
+  return ids.indexOf("|" + commandId + "|") >= 0;
+}
+
+void rememberRemoteCommandApplied(const String& commandId) {
+  String ids = remoteCommandDoneIds();
+  const String token = "|" + commandId + "|";
+  if (ids.indexOf(token) >= 0) return;
+  if (!ids.endsWith("|")) ids += "|";
+  ids += commandId + "|";
+  while (ids.length() > 320) {
+    const int next = ids.indexOf('|', 1);
+    if (next < 0) { ids = "|"; break; }
+    ids.remove(1, next);
+    if (ids.startsWith("||")) ids.remove(1, 1);
+  }
+  Preferences prefs;
+  prefs.begin("cmdids", false);
+  prefs.putString("done", ids);
+  prefs.end();
+}
+
+void applyRemoteCommand(const String& action, JsonObject params, String& result, String& detail) {
+  result = "rejected";
+  detail = "فرمان در این firmware پشتیبانی نمی‌شود";
 #ifdef MODULE_IRRIGATION
   if (action == "zone/on") {
     int zoneId = params["id"] | -1;
     int dur = params["dur"] | 15;
-    if (dur <= 0) dur = 15;
     int idx = irrigation.findZone((uint8_t)zoneId);
-    if (idx >= 0 && irrigation.start(idx, (uint16_t)dur, "REMOTE")) {
-      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-      ackCount++;
-    }
+    if (idx >= 0 && dur > 0 && irrigation.start(idx, (uint16_t)dur, "REMOTE")) { result = "applied"; detail = "آبیاری اجرا شد"; }
+    else detail = "زون یا مدت آبیاری نامعتبر است";
     return;
   }
   if (action == "zone/off") {
     int zoneId = params["id"] | -1;
     int idx = irrigation.findZone((uint8_t)zoneId);
-    if (idx >= 0 && irrigation.stop(idx, "REMOTE")) {
-      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-      ackCount++;
-    }
+    if (idx >= 0 && irrigation.stop(idx, "REMOTE")) { result = "applied"; detail = "زون متوقف شد"; }
+    else detail = "زون پیدا نشد";
     return;
   }
   if (action == "zone/schedule") {
@@ -284,32 +323,36 @@ void applyRemoteCommand(const String& action, JsonObject params, const String& c
     int idx = irrigation.findZone((uint8_t)zoneId);
     if (idx >= 0 && irrigation.setSchedule(idx, (uint8_t)hour, (uint8_t)minute, (uint16_t)dur)) {
       queueEvent("schedule", "set");
-      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-      ackCount++;
+      syncTriggerNow();
+      result = "applied"; detail = "زمان‌بندی ذخیره شد";
+    } else {
+      detail = "زون یا مقادیر زمان‌بندی نامعتبر است";
     }
     return;
   }
   if (action == "pump/on") {
     irrigation.clearPumpOverride();
     irrigation.setPump(true, "REMOTE");
-    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-    ackCount++;
+    result = "applied"; detail = "پمپ روشن شد";
     return;
   }
-  if (action == "pump/off") {
+  if (action == "pump/off" || action == "e") {
     irrigation.clearPumpOverride();
     for (uint8_t i = 0; i < irrigation.zoneCount(); i++) irrigation.stop(i, "REMOTE");
     irrigation.setPump(false, "REMOTE");
-    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-    ackCount++;
+#ifdef MODULE_LIGHTING
+    if (action == "e") lighting.allOff();
+#endif
+    result = "applied"; detail = action == "e" ? "توقف اضطراری آبیاری اجرا شد" : "پمپ و زون‌ها متوقف شدند";
     return;
   }
+#endif
+
   if (action == "e") {
-    irrigation.clearPumpOverride();
-    for (uint8_t i = 0; i < irrigation.zoneCount(); i++) irrigation.stop(i, "REMOTE");
-    irrigation.setPump(false, "REMOTE");
-    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-    ackCount++;
+#ifdef MODULE_LIGHTING
+    lighting.allOff();
+#endif
+    result = "applied"; detail = "توقف اضطراری اجرا شد";
     return;
   }
   if (action == "config/time") {
@@ -318,46 +361,61 @@ void applyRemoteCommand(const String& action, JsonObject params, const String& c
     int day = params["day"] | 1;
     int hour = params["hour"] | 0;
     int minute = params["minute"] | 0;
+    if (year < 2020 || month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+      detail = "تاریخ یا ساعت نامعتبر است";
+      return;
+    }
     rtc.set(DateTime(year, month, day, hour, minute, 0));
+    syncSystemClockFromRtc();
     queueEvent("config", "time-set");
-    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-    ackCount++;
+    result = "applied"; detail = "ساعت تنظیم شد";
     return;
   }
   if (action == "config/sync") {
     String url = params["url"] | String("");
     String apiKey = params["apiKey"] | String("");
     if (url.length()) {
+      if (url.startsWith("https://") && !probeServerUrl(url)) {
+        detail = "اتصال امن به سرور تایید نشد؛ نشانی قبلی حفظ شد";
+        return;
+      }
       setServerUrl(url);
       setServerEnabled(true);
       if (apiKey.length() > 0) setApiKey(apiKey);
       queueEvent("config", "sync-set");
       syncTriggerNow();
-      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-      ackCount++;
+      result = "applied"; detail = "همگام‌سازی تنظیم شد";
+    } else {
+      detail = "نشانی سرور خالی است";
     }
     return;
   }
-#endif
 #ifdef MODULE_LIGHTING
   if (action == "lighting/toggle") {
     int id = params["id"] | 0;
     if (lighting.toggleChannel((uint8_t)id)) {
-      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-      ackCount++;
+      result = "applied"; detail = "وضعیت کانال تغییر کرد";
+    } else {
+      detail = "کانال پیدا نشد";
     }
+    return;
+  }
+  if (action == "lighting/set") {
+    int id = params["id"] | 0;
+    if (!params["state"].is<bool>()) { detail = "وضعیت کانال نامعتبر است"; return; }
+    if (lighting.setChannel((uint8_t)id, params["state"].as<bool>())) {
+      result = "applied"; detail = "وضعیت کانال تنظیم شد";
+    } else detail = "کانال پیدا نشد";
     return;
   }
   if (action == "lighting/all-on") {
     lighting.allOn();
-    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-    ackCount++;
+    result = "applied"; detail = "همه کانال‌ها روشن شدند";
     return;
   }
   if (action == "lighting/all-off") {
     lighting.allOff();
-    ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-    ackCount++;
+    result = "applied"; detail = "همه کانال‌ها خاموش شدند";
     return;
   }
 #endif
@@ -367,50 +425,60 @@ void applyRemoteCommand(const String& action, JsonObject params, const String& c
     if (ssid.length()) {
       wifi.save(ssid, password);
       queueEvent("config", "wifi-set");
-      ackedIdsCsv += (ackedIdsCsv.length() ? "," : "") + commandId;
-      ackCount++;
+      result = "applied"; detail = "تنظیم Wi-Fi ذخیره شد";
       syncTriggerNow();
-    }
+    } else detail = "نام شبکه خالی است";
+    return;
   }
 }
 
-void pollAndExecuteServerCommands() {
+bool pollAndExecuteServerCommands() {
   static uint32_t lastPoll = 0;
-  static uint32_t pollInterval = 3000;
+  static uint32_t pollInterval = 1000;
   uint32_t now = millis();
-  if ((now - lastPoll) < pollInterval) return;
+  if ((now - lastPoll) < pollInterval) return false;
   lastPoll = now;
 
   if (!getServerEnabled() || WiFi.status() != WL_CONNECTED || getServerUrl().length() == 0) {
-    return;
+    return false;
   }
 
   String response;
-  if (!pollServerCommands(response, 2500)) return;
+  if (!pollServerCommands(response, 1200)) return false;
 
   const size_t cap = 2048;
   DynamicJsonDocument doc(cap);
-  if (deserializeJson(doc, response) != DeserializationError::Ok) return;
-  if (!doc["ok"].as<bool>()) return;
+  if (deserializeJson(doc, response) != DeserializationError::Ok) return false;
+  if (!doc["ok"].as<bool>()) return false;
 
   JsonArray cmds = doc["commands"].as<JsonArray>();
-  if (!cmds || cmds.isNull() || cmds.size() == 0) return;
+  if (!cmds || cmds.isNull() || cmds.size() == 0) return false;
 
-  String ackIds = "[";
-  size_t ackCount = 0;
+  JsonObject item = cmds[0];
+  const String action = item["action"] | String("");
+  const String commandId = item["id"] | String("");
+  if (commandId.length() == 0 || action.length() == 0) return false;
 
-  for (JsonObject item : cmds) {
-    const String action = item["action"] | String("");
-    JsonObject params = item["params"] | JsonObject();
-      const String commandId = item["id"] | String("");
-      if (commandId.length() == 0 || action.length() == 0) continue;
-      applyRemoteCommand(action, params, commandId, ackIds, ackCount);
+  String result = "rejected";
+  String detail;
+  const JsonVariant remaining = item["remainingMs"];
+  if (!remaining.isNull() && remaining.as<uint32_t>() == 0) {
+    result = "expired";
+    detail = "مهلت فرمان هنگام دریافت تمام شد";
+  } else if (remoteCommandWasApplied(commandId)) {
+    result = "applied";
+    detail = "فرمان قبلاً اجرا شده بود؛ اجرای دوباره انجام نشد";
+  } else {
+    JsonObject params = item["params"].as<JsonObject>();
+    applyRemoteCommand(action, params, result, detail);
+    if (result == "applied") rememberRemoteCommandApplied(commandId);
   }
-
-  if (ackCount > 0) {
-    ackIds += "]";
-    ackServerCommands(ackIds);
+  ackServerCommand(commandId, result, detail);
+  if (result == "applied") {
+    syncTriggerNow();
+    return true;
   }
+  return false;
 }
 
 void loop() {
@@ -430,15 +498,17 @@ void loop() {
   webApp.update();
   static String serverStatusCache;
   static uint32_t serverStatusCacheTs = 0;
-  if (serverStatusCacheTs == 0 || (now - serverStatusCacheTs) >= 5000) {
+  const bool remoteCommandApplied = pollAndExecuteServerCommands();
+  if (remoteCommandApplied || serverStatusCacheTs == 0 || (now - serverStatusCacheTs) >= 5000) {
     serverStatusCache = buildServerStatusJson();
-    serverStatusCacheTs = now;
+    serverStatusCacheTs = millis();
   }
+
+  // Keep command retrieval ahead of the slower telemetry retry path; refresh status immediately after changes.
   syncLoop(serverStatusCache);
 
   // Handle OTA updates
   ArduinoOTA.handle();
-  pollAndExecuteServerCommands();
 
   handleCLI();
   delay(2);

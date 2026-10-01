@@ -6,3 +6,4 @@
 server/node_modules/
 server/greenhouse.db
 server/greenhouse.db-*
+.DS_Store

@@ -14,16 +14,22 @@ const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const FIRMWARE_DIR = path.join(__dirname, 'firmware');
 const COMMANDS_FILE = path.join(DATA_DIR, 'commands.json');
+const COMMAND_RESULTS_FILE = path.join(DATA_DIR, 'command-results.json');
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const MAX_EVENTS = 20000;
-const COMMAND_TTL_MS = 24 * 60 * 60 * 1000;
-const COMMAND_POLL_LIMIT = 50;
+const ACTUATION_TTL_MS = 30 * 1000;
+const CONFIG_TTL_MS = 5 * 60 * 1000;
+const STOP_TTL_MS = 5 * 60 * 1000;
+const DEVICE_ONLINE_TTL_MS = 45 * 1000;
+const COMMAND_QUEUE_LIMIT = 50;
+const COMMAND_HISTORY_LIMIT = 50;
 
 // --------------- Store ---------------
 let events = [];
 let deviceStates = {};
 let users = [];
 let commands = {};
+let commandResults = {};
 
 function initStore() {
   [DATA_DIR, FIRMWARE_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
@@ -34,6 +40,25 @@ function initStore() {
     commands = JSON.parse(fs.readFileSync(COMMANDS_FILE, 'utf8') || '{}');
     if (typeof commands !== 'object' || commands === null) commands = {};
   } catch(e) { commands = {}; }
+  try {
+    commandResults = JSON.parse(fs.readFileSync(COMMAND_RESULTS_FILE, 'utf8') || '{}');
+    if (typeof commandResults !== 'object' || commandResults === null) commandResults = {};
+  } catch(e) { commandResults = {}; }
+  let migratedCommands = false;
+  const now = nowTs();
+  for (const list of Object.values(commands)) {
+    if (!Array.isArray(list)) continue;
+    for (const command of list) {
+      if (command.expiresAt !== undefined && command.expiresAt !== null) continue;
+      const createdAt = Number(command.createdAt) || now;
+      const isStopBarrier = command.action === 'e' || command.action === 'pump/off' || command.action === 'zone/off' || command.action === 'lighting/all-off' || (command.action === 'lighting/set' && command.params && command.params.state === false);
+      const ttl = isStopBarrier ? STOP_TTL_MS : (['zone/on', 'pump/on', 'lighting/toggle', 'lighting/set'].includes(command.action) ? ACTUATION_TTL_MS : CONFIG_TTL_MS);
+      command.expiresAt = createdAt + ttl;
+      migratedCommands = true;
+    }
+  }
+  if (migratedCommands) saveCommands();
+  pruneExpiredCommands();
   console.log(`[Store] ${events.length} events, ${Object.keys(deviceStates).length} devices, ${users.length} users`);
 }
 
@@ -51,6 +76,9 @@ function saveUsers() {
 }
 function saveCommands() {
   try { fs.writeFileSync(COMMANDS_FILE, JSON.stringify(commands), 'utf8'); } catch(e) {}
+}
+function saveCommandResults() {
+  try { fs.writeFileSync(COMMAND_RESULTS_FILE, JSON.stringify(commandResults), 'utf8'); } catch(e) {}
 }
 
 function addEvent(deviceId, type, state, ts) {
@@ -80,7 +108,7 @@ function getStats() {
 function getPrimaryDeviceId() {
   const entries = Object.entries(deviceStates);
   if (!entries.length) return null;
-  const online = entries.find(([, info]) => (Date.now() - (info.lastSeen || 0)) < 120000);
+  const online = entries.find(([, info]) => isDeviceOnline(info));
   if (online) return online[0];
   return entries.sort((a, b) => (b[1].lastSeen || 0) - (a[1].lastSeen || 0))[0][0];
 }
@@ -115,6 +143,9 @@ function checkPassword(pw, hash) {
 
 // --------------- Express ---------------
 const app = express();
+// The app is served behind the host Nginx reverse proxy (HTTPS terminates there).
+// Trust that single hop so secure session cookies survive the TLS proxy.
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '128kb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -151,7 +182,7 @@ function requireAuth(req, res, next) {
 
 function requireApiKey(req, res, next) {
   const apiKey = process.env.API_KEY;
-  if (!apiKey) return next();
+  if (!apiKey) return res.status(503).json({ error: 'device api key is not configured' });
   const provided = req.headers['x-api-key'] || req.headers['x-apikey'] || '';
   if (provided !== apiKey) return res.status(401).json({ error: 'invalid api key' });
   next();
@@ -172,47 +203,132 @@ function resolveRecoverPage(msg = '') {
 
 function nowTs() { return Date.now(); }
 
+function getLastContactAt(info = {}) {
+  return Math.max(Number(info.lastSeen) || 0, Number(info.lastCommandPollAt) || 0);
+}
+
+function getLastTelemetryAt(info = {}) {
+  return Number(info.lastTelemetryAt) || Number(info.lastSeen) || 0;
+}
+
+function isDeviceOnline(info, now = nowTs()) {
+  const lastContactAt = getLastContactAt(info);
+  const age = now - lastContactAt;
+  return lastContactAt > 0 && age >= 0 && age <= DEVICE_ONLINE_TTL_MS;
+}
+
 function pickDeviceId(requestedId = '') {
   if (requestedId && deviceStates[requestedId]) return requestedId;
-  const firstOnline = Object.entries(deviceStates).find(([, info]) => (Date.now() - (info.lastSeen || 0)) < 120000);
+  const firstOnline = Object.entries(deviceStates).find(([, info]) => isDeviceOnline(info));
   if (firstOnline) return firstOnline[0];
   return requestedId || null;
 }
 
 function pruneExpiredCommands() {
   const now = nowTs();
+  let changed = false;
   Object.keys(commands).forEach((deviceId) => {
     const list = commands[deviceId] || [];
-    const alive = list.filter((c) => !c.createdAt || (now - c.createdAt) < COMMAND_TTL_MS);
+    const alive = list.filter((c) => {
+      if (!c.expiresAt || now < c.expiresAt) return true;
+      recordCommandResult(deviceId, c, 'expired', 'مهلت اجرا تمام شد', false);
+      changed = true;
+      return false;
+    });
     if (!alive.length) delete commands[deviceId];
     else commands[deviceId] = alive;
   });
+  if (changed) { saveCommands(); saveCommandResults(); }
 }
 
 function newCommandId() {
   return `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6)}`;
 }
 
+function commandResourceKey(action, params = {}) {
+  if (action === 'pump/on' || action === 'pump/off') return 'pump';
+  if (action === 'zone/on' || action === 'zone/off') return `zone:${params.id}`;
+  if (action === 'lighting/toggle' || action === 'lighting/set') return `light:${params.id}`;
+  if (action.startsWith('lighting/all-')) return 'lighting:*';
+  if (action.startsWith('zone/schedule')) return `schedule:${params.id}`;
+  if (action.startsWith('config/')) return action;
+  return action;
+}
+
+function recordCommandResult(deviceId, command, status, detail = '', persist = true) {
+  if (!commandResults[deviceId]) commandResults[deviceId] = [];
+  const history = commandResults[deviceId];
+  const entry = {
+    id: String(command.id), action: command.action,
+    status, detail, createdAt: command.createdAt || nowTs(),
+    expiresAt: command.expiresAt || null, updatedAt: nowTs()
+  };
+  const existing = history.findIndex((item) => String(item.id) === entry.id);
+  if (existing >= 0) history.splice(existing, 1);
+  history.push(entry);
+  if (history.length > COMMAND_HISTORY_LIMIT) history.splice(0, history.length - COMMAND_HISTORY_LIMIT);
+  if (persist) saveCommandResults();
+}
+
 function pushCommand(deviceId, action, params = {}) {
   const id = newCommandId();
   const createdAt = nowTs();
+  const isEmergencyStop = action === 'e';
+  const isStopBarrier = isEmergencyStop || action === 'pump/off' || action === 'zone/off' || action === 'lighting/all-off' || (action === 'lighting/set' && params.state === false);
+  const ttlMs = isStopBarrier ? STOP_TTL_MS : (action === 'zone/on' || action === 'pump/on' || action === 'lighting/toggle' || action === 'lighting/set'
+    ? ACTUATION_TTL_MS : CONFIG_TTL_MS);
+  const expiresAt = createdAt + ttlMs;
+  const command = { id, action, params, createdAt, expiresAt, source: 'dashboard', status: 'queued' };
   if (!commands[deviceId]) commands[deviceId] = [];
-  commands[deviceId].push({ id, action, params, createdAt, source: 'dashboard' });
-  if (commands[deviceId].length > COMMAND_POLL_LIMIT) {
-    commands[deviceId] = commands[deviceId].slice(-COMMAND_POLL_LIMIT);
+
+  if (isStopBarrier) {
+    for (const old of commands[deviceId]) recordCommandResult(deviceId, old, 'canceled', 'فرمان توقف صف قبلی را پاک کرد', false);
+    commands[deviceId] = [command];
+  } else {
+    const key = commandResourceKey(action, params);
+    const clearsLighting = action === 'lighting/all-on' || action === 'lighting/all-off';
+    const current = commands[deviceId];
+    const next = current.filter((old) => {
+      const oldKey = commandResourceKey(old.action, old.params);
+      const superseded = clearsLighting ? oldKey.startsWith('light:') || oldKey === 'lighting:*' : oldKey === key;
+      return !superseded;
+    });
+    if (next.length >= COMMAND_QUEUE_LIMIT) return null;
+    current.forEach((old) => {
+      if (!next.includes(old)) recordCommandResult(deviceId, old, 'superseded', 'فرمان جدیدتر جایگزینش کرد', false);
+    });
+    const urgentStop = action === 'pump/off' || action === 'zone/off' || action === 'lighting/all-off';
+    if (urgentStop) next.unshift(command);
+    else next.push(command);
+    commands[deviceId] = next;
   }
+  recordCommandResult(deviceId, command, 'queued', 'در انتظار برد');
   saveCommands();
-  return { id, action, params, createdAt };
+  return { id, action, params, createdAt, expiresAt, status: 'queued' };
 }
 
-function ackCommands(deviceId, ids = []) {
+function ackCommands(deviceId, results = []) {
   if (!commands[deviceId]) return 0;
   const before = commands[deviceId].length;
-  const remove = new Set(ids.map((x) => String(x)));
-  commands[deviceId] = commands[deviceId].filter((c) => !remove.has(String(c.id)));
+  const normalized = results.map((result) => typeof result === 'object'
+    ? { id: String(result.id || ''), status: ['rejected', 'expired'].includes(result.status) ? result.status : 'applied', detail: String(result.detail || '') }
+    : { id: String(result), status: 'applied', detail: 'تأیید برد' });
+  const byId = new Map(normalized.map((result) => [result.id, result]));
+  commands[deviceId] = commands[deviceId].filter((command) => {
+    const result = byId.get(String(command.id));
+    if (!result) return true;
+    recordCommandResult(deviceId, command, result.status, result.detail);
+    return false;
+  });
   const removed = before - commands[deviceId].length;
   if (removed > 0) saveCommands();
   return removed;
+}
+
+function respondQueuedCommand(res, deviceId, action, params = {}) {
+  const command = pushCommand(deviceId, action, params);
+  if (!command) return res.status(429).json({ ok: false, error: 'command queue full' });
+  return res.json({ ok: true, queued: true, command });
 }
 
 initStore();
@@ -243,8 +359,22 @@ app.post('/login', (req, res) => {
       if (!valid) return res.type('html').send(loginPage('کد ۲عاملی نامعتبر است'));
     } catch(e) { return res.type('html').send(loginPage('خطا در بررسی کد')); }
   }
-  req.session.user = { username: user.username };
-  req.session.save(() => res.redirect('/'));
+  // Rotate the session id after authentication and do not silently redirect
+  // when the session store failed to persist it (which looks like a login loop).
+  req.session.regenerate((regenerateError) => {
+    if (regenerateError) {
+      console.error('[Auth] session regeneration failed:', regenerateError.message);
+      return res.status(500).type('html').send(loginPage('ساخت نشست ورود ناموفق بود؛ دوباره تلاش کنید'));
+    }
+    req.session.user = { username: user.username };
+    req.session.save((saveError) => {
+      if (saveError) {
+        console.error('[Auth] session save failed:', saveError.message);
+        return res.status(500).type('html').send(loginPage('ذخیره نشست ورود ناموفق بود؛ دوباره تلاش کنید'));
+      }
+      return res.redirect(303, '/');
+    });
+  });
 });
 
 // Setup (first run)
@@ -324,13 +454,17 @@ app.get('/logout', (req, res) => {
 });
 
 // Receive events from ESP32
-app.post('/api/events', (req, res) => {
+app.post('/api/events', requireApiKey, (req, res) => {
   if (!req.body) return res.status(400).json({ error: 'invalid json' });
   const { deviceId, uptime, events: evts, status: devStatus } = req.body;
   if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  const receivedAt = nowTs();
+  const previous = deviceStates[deviceId] || {};
   if (!Array.isArray(evts) || evts.length === 0) {
     deviceStates[deviceId] = {
-      lastSeen: Date.now(),
+      ...previous,
+      lastSeen: receivedAt,
+      lastTelemetryAt: receivedAt,
       uptime: uptime || 0,
       ip: req.ip,
       status: devStatus && typeof devStatus === 'object' ? devStatus : (devStatus || {})
@@ -339,7 +473,9 @@ app.post('/api/events', (req, res) => {
     return res.json({ ok: true, received: 0, note: 'no-events' });
   }
   deviceStates[deviceId] = {
-    lastSeen: Date.now(),
+    ...previous,
+    lastSeen: receivedAt,
+    lastTelemetryAt: receivedAt,
     uptime: uptime || 0,
     ip: req.ip,
     status: devStatus && typeof devStatus === 'object' ? devStatus : (devStatus || {})
@@ -363,9 +499,12 @@ app.get('/api/events', (req, res) => {
 
 // Devices
 app.get('/api/devices', (req, res) => {
+  const now = nowTs();
   const list = Object.entries(deviceStates).map(([id, info]) => ({
-    id, lastSeen: info.lastSeen, uptime: info.uptime, ip: info.ip,
-    online: (Date.now() - info.lastSeen) < 120000
+    id, lastSeen: getLastContactAt(info), lastTelemetryAt: getLastTelemetryAt(info),
+    uptime: info.uptime, ip: info.ip,
+    online: isDeviceOnline(info, now),
+    telemetryAgeMs: getLastTelemetryAt(info) ? Math.max(0, now - getLastTelemetryAt(info)) : null
   }));
   res.json(list);
 });
@@ -380,8 +519,8 @@ app.post('/api/zone/on', requireControl, (req, res) => {
   const zoneId = parseInt(req.body.id || req.query.id || req.body.zoneId || req.query.zoneId, 10);
   const duration = parseInt(req.body.dur || req.body.duration || req.query.duration || 15, 10);
   if (!Number.isFinite(zoneId) || zoneId <= 0) return res.status(400).json({ error: 'invalid zone id' });
-  const command = pushCommand(deviceId, 'zone/on', { id: zoneId, dur: duration });
-  res.json({ ok: true, command });
+  if (!Number.isFinite(duration) || duration < 1 || duration > 480) return res.status(400).json({ error: 'invalid duration' });
+  respondQueuedCommand(res, deviceId, 'zone/on', { id: zoneId, dur: duration });
 });
 
 app.post('/api/zone/off', requireControl, (req, res) => {
@@ -389,8 +528,7 @@ app.post('/api/zone/off', requireControl, (req, res) => {
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
   const zoneId = parseInt(req.body.id || req.query.id || req.body.zoneId || req.query.zoneId, 10);
   if (!Number.isFinite(zoneId) || zoneId <= 0) return res.status(400).json({ error: 'invalid zone id' });
-  const command = pushCommand(deviceId, 'zone/off', { id: zoneId });
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'zone/off', { id: zoneId });
 });
 
 app.post('/api/zone/schedule', requireControl, (req, res) => {
@@ -404,8 +542,7 @@ app.post('/api/zone/schedule', requireControl, (req, res) => {
   if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59)
     return res.status(400).json({ error: 'invalid schedule time' });
   if (!Number.isFinite(dur) || dur < 1 || dur > 480) return res.status(400).json({ error: 'invalid duration' });
-  const command = pushCommand(deviceId, 'zone/schedule', { id: zoneId, hour, minute, dur });
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'zone/schedule', { id: zoneId, hour, minute, dur });
 });
 
 app.post('/api/zone/add', requireControl, (req, res) => {
@@ -415,29 +552,25 @@ app.post('/api/zone/add', requireControl, (req, res) => {
   const pin = parseInt(req.body.pin ?? req.query.pin, 10);
   if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid zone id' });
   if (!Number.isFinite(pin) || pin < 0 || pin > 39) return res.status(400).json({ error: 'invalid gpio' });
-  const command = pushCommand(deviceId, 'zone/add', { id, pin });
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'zone/add', { id, pin });
 });
 
 app.post('/api/pump/on', requireControl, (req, res) => {
   const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
-  const command = pushCommand(deviceId, 'pump/on', {});
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'pump/on', {});
 });
 
 app.post('/api/pump/off', requireControl, (req, res) => {
   const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
-  const command = pushCommand(deviceId, 'pump/off', {});
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'pump/off', {});
 });
 
 app.post('/api/e', requireControl, (req, res) => {
   const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
-  const command = pushCommand(deviceId, 'e', {});
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'e', {});
 });
 
 app.post('/api/lighting/toggle', requireControl, (req, res) => {
@@ -445,22 +578,29 @@ app.post('/api/lighting/toggle', requireControl, (req, res) => {
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
   const id = parseInt(req.body.id || req.query.id, 10);
   if (!Number.isFinite(id) || id < 0) return res.status(400).json({ error: 'invalid channel id' });
-  const command = pushCommand(deviceId, 'lighting/toggle', { id });
-  res.json({ ok: true, command });
+  const state = req.body.state;
+  if (typeof state === 'boolean') return respondQueuedCommand(res, deviceId, 'lighting/set', { id, state });
+  respondQueuedCommand(res, deviceId, 'lighting/toggle', { id });
+});
+
+app.post('/api/lighting/set', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const id = parseInt(req.body.id || req.query.id, 10);
+  if (!Number.isFinite(id) || id <= 0 || typeof req.body.state !== 'boolean') return res.status(400).json({ error: 'invalid channel state' });
+  respondQueuedCommand(res, deviceId, 'lighting/set', { id, state: req.body.state });
 });
 
 app.post('/api/lighting/all-on', requireControl, (req, res) => {
   const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
-  const command = pushCommand(deviceId, 'lighting/all-on', {});
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'lighting/all-on', {});
 });
 
 app.post('/api/lighting/all-off', requireControl, (req, res) => {
   const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
-  const command = pushCommand(deviceId, 'lighting/all-off', {});
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'lighting/all-off', {});
 });
 
 app.post('/api/config/sync', requireControl, (req, res) => {
@@ -468,8 +608,7 @@ app.post('/api/config/sync', requireControl, (req, res) => {
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
   const url = String(req.body.url || req.query.url || '').trim();
   if (!url) return res.status(400).json({ error: 'url required' });
-  const command = pushCommand(deviceId, 'config/sync', { url });
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'config/sync', { url });
 });
 
 app.post('/api/config/time', requireControl, (req, res) => {
@@ -484,8 +623,7 @@ app.post('/api/config/time', requireControl, (req, res) => {
   if (![year, month, day, hour, minute].every((v) => Number.isFinite(v))) {
     return res.status(400).json({ error: 'invalid time fields' });
   }
-  const command = pushCommand(deviceId, 'config/time', { year, month, day, hour, minute });
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'config/time', { year, month, day, hour, minute });
 });
 
 app.post('/api/config/wifi', requireControl, (req, res) => {
@@ -494,16 +632,22 @@ app.post('/api/config/wifi', requireControl, (req, res) => {
   const ssid = (req.body.ssid || req.query.ssid || '').trim();
   const password = String(req.body.password || req.query.password || '');
   if (!ssid) return res.status(400).json({ error: 'ssid required' });
-  const command = pushCommand(deviceId, 'config/wifi', { ssid, password });
-  res.json({ ok: true, command });
+  respondQueuedCommand(res, deviceId, 'config/wifi', { ssid, password });
 });
 
 app.get('/api/commands', requireApiKey, (req, res) => {
   pruneExpiredCommands();
   const deviceId = String(req.query.device || req.headers['x-device-id'] || 'esp32-irrigation');
+  const now = nowTs();
+  const deviceInfo = deviceStates[deviceId];
+  if (deviceInfo) {
+    if (!deviceInfo.lastTelemetryAt) deviceInfo.lastTelemetryAt = Number(deviceInfo.lastSeen) || now;
+    deviceInfo.lastCommandPollAt = now;
+    deviceInfo.lastSeen = now;
+  }
   const list = commands[deviceId] || [];
-  const limit = Math.min(Math.max(1, parseInt(req.query.limit || COMMAND_POLL_LIMIT, 10)), COMMAND_POLL_LIMIT);
-  const payload = list.slice(0, Math.max(1, limit));
+  const head = list[0];
+  const payload = head ? [Object.assign({}, head, { remainingMs: head.expiresAt ? Math.max(0, head.expiresAt - nowTs()) : null })] : [];
   res.json({ ok: true, deviceId, count: payload.length, commands: payload, pending: list.length });
 });
 
@@ -511,14 +655,15 @@ app.get('/api/commands/status', requireControl, (req, res) => {
   pruneExpiredCommands();
   const deviceId = pickDeviceId(req.query.deviceId || req.query.device);
   const list = deviceId ? (commands[deviceId] || []) : [];
-  res.json({ ok: true, deviceId, pending: list.length, commands: list.slice(0, COMMAND_POLL_LIMIT) });
+  const history = deviceId ? (commandResults[deviceId] || []) : [];
+  res.json({ ok: true, deviceId, pending: list.length, commands: list.slice(0, COMMAND_QUEUE_LIMIT), recent: history.slice(-COMMAND_HISTORY_LIMIT) });
 });
 
 // Device ACK consumed commands
 app.post('/api/commands/ack', requireApiKey, (req, res) => {
   const deviceId = req.body.deviceId || req.headers['x-device-id'] || 'esp32-irrigation';
-  const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
-  const removed = ackCommands(deviceId, ids);
+  const results = Array.isArray(req.body.results) ? req.body.results : (Array.isArray(req.body.ids) ? req.body.ids : []);
+  const removed = ackCommands(deviceId, results);
   pruneExpiredCommands();
   res.json({ ok: true, removed, remaining: (commands[deviceId] || []).length });
 });
@@ -532,9 +677,24 @@ app.get('/api/irrigation/timeline', (req, res) => {
 
 // === FULL STATUS for new dashboard ===
 app.get('/api/status-full', (req, res) => {
+  pruneExpiredCommands();
   const deviceInfo = {};
+  const now = nowTs();
   for (const [id, s] of Object.entries(deviceStates)) {
-    deviceInfo[id] = Object.assign({}, s, { wifi: s.status ? (s.status.wifi || {}) : {}, rtc: s.status ? (s.status.rtc || {}) : {}, health: s.status ? (s.status.health || {}) : {}, irrigation: s.status ? getIrrigationDataFor(s.status.irrigation) : null, lighting: s.status ? getLightingDataFor(s.status.lighting) : null });
+    const telemetryAt = getLastTelemetryAt(s);
+    const lastContactAt = getLastContactAt(s);
+    deviceInfo[id] = Object.assign({}, s, {
+      lastSeen: lastContactAt,
+      lastTelemetryAt: telemetryAt || null,
+      communicationAgeMs: lastContactAt ? Math.max(0, now - lastContactAt) : null,
+      telemetryAgeMs: telemetryAt ? Math.max(0, now - telemetryAt) : null,
+      online: isDeviceOnline(s, now),
+      wifi: s.status ? (s.status.wifi || {}) : {},
+      rtc: s.status ? (s.status.rtc || {}) : {},
+      health: s.status ? (s.status.health || {}) : {},
+      irrigation: s.status ? getIrrigationDataFor(s.status.irrigation) : null,
+      lighting: s.status ? getLightingDataFor(s.status.lighting) : null
+    });
   }
   res.json({
     devices: Object.keys(deviceStates),
@@ -542,7 +702,8 @@ app.get('/api/status-full', (req, res) => {
     allEvents: events.slice(-120),
     timeline: getTimelineData(),
     stats: getStats(),
-    pendingCommands: Object.fromEntries(Object.keys(commands).map((id) => [id, (commands[id] || []).length]))
+    pendingCommands: Object.fromEntries(Object.keys(commands).map((id) => [id, (commands[id] || []).length])),
+    recentCommands: commandResults
   });
 });
 
@@ -628,7 +789,7 @@ app.get('/', requireAuth, (req, res) => {
 // Firmware upload
 const multer = require('multer');
 const upload = multer({ dest: FIRMWARE_DIR });
-app.post('/api/firmware', upload.single('firmware'), (req, res) => {
+app.post('/api/firmware', requireControl, upload.single('firmware'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'no file' });
   const ext = path.extname(req.file.originalname) || '.bin';
   const dest = path.join(FIRMWARE_DIR, `firmware-${Date.now()}${ext}`);
@@ -719,6 +880,7 @@ canvas.cnv{width:100%;height:70px;display:block;border-radius:6px}
 <div class="ri"><select class="dsel" id="devSel"></select><span class="clk" id="clock">--:--:--</span><span class="dot g" id="dot"></span></div></div>
 <div class="insights" id="insights"></div>
 <div class="notice" id="notice"></div>
+<div class="notice" id="commandNotice"></div>
 <nav class="tabs" id="tabs">
 <button class="tab" data-pg="overview">نمای کلی</button>
 <button class="tab on" data-pg="irrigation">آبیاری</button>
@@ -734,7 +896,7 @@ canvas.cnv{width:100%;height:70px;display:block;border-radius:6px}
 <div class="bar"><span>نسخه ۲.۱</span><a href="/logout">خروج</a></div>
 </main>
 <script>
-var page='irrigation',st=null,did='',dids=[],lastCmdAt=0,refreshBusy=false;
+var page='irrigation',st=null,did='',dids=[],lastCmdAt=0,lastCommandId='',refreshBusy=false,commandChain=Promise.resolve();
 window.addEventListener('error',function(e){
   console.error('[Dashboard error]',e.error||e.message);
   try{toast('خطای نمایش رخ داد؛ صفحه در حال تلاش مجدد است',true)}catch(_){}
@@ -754,12 +916,24 @@ async function refresh(){
     if(!r.ok)throw new Error('HTTP '+r.status);
     st=await r.json();
     if(!did&&st.devices&&st.devices.length)did=st.devices[0];
-    setNotice('');renderAll()
+    setNotice('');renderAll();renderCommandFeedback()
   }catch(e){
     console.error('[refresh]',e);setNotice('ارتباط داشبورد با API برقرار نیست: '+e.message)
   }finally{refreshBusy=false}
 }
 function setNotice(msg){var n=$('notice');if(!n)return;n.textContent=msg||'';n.classList.toggle('on',!!msg)}
+function renderCommandFeedback(){
+  var n=$('commandNotice');if(!n||!lastCommandId||!st)return;
+  var list=st.recentCommands&&st.recentCommands[did]?st.recentCommands[did]:[];
+  var c=list.find(function(x){return String(x.id)===String(lastCommandId)});
+  if(!c){n.textContent='فرمان ثبت شد؛ منتظر پاسخ برد';n.classList.add('on');return}
+  var d=st.deviceInfo&&st.deviceInfo[did],labels={queued:'در صف ارسال به برد',applied:'برد اجرای فرمان را تأیید کرد',rejected:'برد فرمان را رد کرد',expired:'مهلت فرمان تمام شد و اجرا نشد',canceled:'با فرمان توقف لغو شد',superseded:'با فرمان جدیدتر جایگزین شد'};
+  var state=c.status==='queued'&&d&&!d.online?'برد آفلاین است؛ فرمان در صف می‌ماند':'فرمان '+lastCommandId+' — '+(labels[c.status]||c.status);
+  if(c.status==='queued'&&c.expiresAt){var left=Math.max(0,Math.ceil((c.expiresAt-Date.now())/1000));state+='؛ '+left+' ثانیه تا انقضا'}
+  else if(c.detail)state+=': '+c.detail;
+  n.textContent=state;
+  n.classList.add('on')
+}
 function renderAll(){
   if(!st)return;
   var saved={};
@@ -793,8 +967,9 @@ function renderDevSel(){
 }
 function updateDot(){
   var dot=$('dot'),d=st&&st.deviceInfo?st.deviceInfo[did]:null;
-  var online=d&&Date.now()-(d.lastSeen||0)<120000;
+  var online=!!(d&&d.online);
   dot.className='dot '+(online?'g':'r');
+  dot.title=online?'برد متصل است':'برد آفلاین است';
 }
 function renderInsights(){
   var d=st&&st.deviceInfo?st.deviceInfo[did]:null,w={connected:false},irr={},lt={},rt={valid:false},hl={freeHeapKB:0,uptimeMin:0};
@@ -804,7 +979,7 @@ function renderInsights(){
   var soil=irr.soilPercent!=null?irr.soilPercent:'--';
   var pending=st&&st.pendingCommands&&did?(st.pendingCommands[did]||0):0;
   var items=[
-    {v:w.connected?'متصل':'قطع',l:'Wi-Fi',c:w.connected?'g':'r'},
+    {v:d&&d.online?'در دسترس':'آفلاین',l:'ارتباط برد با سرور',c:d&&d.online?'g':'r'},
     {v:irr.pumpOn?'روشن':'خاموش',l:'پمپ',c:irr.pumpOn?'g':'r'},
     {v:actZ,l:'زون فعال',c:actZ?'y':''},
     {v:soil+'%',l:'رطوبت خاک',c:soil!='--'&&soil<30?'r':'g'},
@@ -818,7 +993,7 @@ function renderInsights(){
   $('insights').innerHTML=h
 }
 function renderOverview(){
-  var s=st.stats||{},d=st.devices||[],ol=d.map(function(id){var di=st.deviceInfo[id];return di?'✓ '+id+' (آنلاین)':'✗ '+id}).join('<br>');
+  var s=st.stats||{},d=st.devices||[],ol=d.map(function(id){var di=st.deviceInfo[id],online=!!(di&&di.online),age=di&&di.communicationAgeMs!=null?Math.floor(di.communicationAgeMs/1000):null;return(online?'✓ ':'✗ ')+id+' ('+(online?'آنلاین':'آفلاین')+(age!=null?'؛ آخرین ارتباط '+age+' ثانیه پیش':'')+')'}).join('<br>');
   var h='<div class="card"><span class="ct">📊 وضعیت سیستم</span><div style="font-size:.8rem;color:var(--sub);line-height:1.8">';
   h+='دستگاه‌ها: '+s.devices+'<br>رویداد امروز: '+s.todayEvents+'<br>کل رویدادها: '+s.totalEvents+'<br>دقیقه آبیاری: '+(s.irrigationMinutes||0)+'</div></div>';
   h+='<div class="card"><span class="ct">🖥 دستگاه‌ها</span><div style="font-size:.78rem;color:var(--sub);line-height:1.8">'+ol+'</div></div>';
@@ -845,7 +1020,7 @@ function renderLighting(){
   h+='<div class="cnv-wrap"><div class="cnv-t">📊 وضعیت نور ۲۴ ساعته</div><canvas class="cnv" id="cvLight" width="600" height="70"></canvas></div>';
   var chs=lt.channels||lt.state||[];
   chs.forEach(function(c){
-    h+='<div class="card"><div class="ch"><span class="ct">کانال '+c.id+' • GPIO'+c.pin+'</span><span class="stg '+(c.state?'run':'off')+'">'+(c.state?'روشن':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">زمانبندی: '+(c.scheduleEnabled?c.onTime+' تا '+c.offTime:'غیرفعال')+'</div><button class="bt '+(c.state?'r':'g')+' sm" onclick="act(\\'lighting/toggle\\',{id:'+c.id+'})">تغییر وضعیت</button></div>'
+    h+='<div class="card"><div class="ch"><span class="ct">کانال '+c.id+' • GPIO'+c.pin+'</span><span class="stg '+(c.state?'run':'off')+'">'+(c.state?'روشن':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">زمانبندی: '+(c.scheduleEnabled?c.onTime+' تا '+c.offTime:'غیرفعال')+'</div><button class="bt '+(c.state?'r':'g')+' sm" onclick="act(\\'lighting/set\\',{id:'+c.id+',state:'+(!c.state)+'})">'+(c.state?'خاموش کردن':'روشن کردن')+'</button></div>'
   });
   $('pg-lighting').innerHTML=h
 }
@@ -895,6 +1070,7 @@ function toast(msg,isErr){
   t._h=setTimeout(function(){t.style.opacity='0'},2600);
 }
 function act(path,params){
+  var execute=function(){
   var url='/api/'+path;
   var source=(window.event&&window.event.target)?window.event.target:null;
   var btn=source&&(source.tagName==='BUTTON')?source:(source&&source.closest?source.closest('button'):null);
@@ -911,6 +1087,7 @@ function act(path,params){
     if(btn&&btn.tagName==='BUTTON'){btn.disabled=false;btn.textContent=origTxt}
     if(res.ok&&res.body&&res.body.ok){
       toast('✓ فرمان ثبت شد'+(res.body.command?('؛ در انتظار دریافت برد'):''));
+      if(res.body.command){lastCommandId=res.body.command.id;renderCommandFeedback()}
       lastCmdAt=Date.now();
       refresh();
     } else {
@@ -920,6 +1097,8 @@ function act(path,params){
     if(btn&&btn.tagName==='BUTTON'){btn.disabled=false;btn.textContent=origTxt}
     toast('✗ ارتباط با سرور برقرار نشد',true);
   });
+  };
+  commandChain=commandChain.then(execute,execute);
 }
 
 function drawCharts(){
@@ -995,3 +1174,4 @@ server.listen(PORT, '0.0.0.0', () => {
 process.on('SIGINT', () => { saveEvents(); saveDevices(); saveUsers(); process.exit(); });
 process.on('SIGTERM', () => { saveEvents(); saveDevices(); saveUsers(); process.exit(); });
 setInterval(() => { saveEvents(); saveDevices(); }, 30000);
+setInterval(pruneExpiredCommands, 1000);
