@@ -913,7 +913,7 @@ canvas.cnv{width:100%;height:70px;display:block;border-radius:6px}
 <div class="bar"><span>نسخه ۲.۱</span><a href="/logout">خروج</a></div>
 </main>
 <script>
-var page='irrigation',st=null,did='',dids=[],lastCmdAt=0,lastCommandId='',refreshBusy=false,commandChain=Promise.resolve();
+var page='irrigation',st=null,did='',dids=[],lastCmdAt=0,lastCommandId='',refreshBusy=false,commandChain=Promise.resolve(),scheduleEditLock=false;
 window.addEventListener('error',function(e){
   console.error('[Dashboard error]',e.error||e.message);
   try{toast('خطای نمایش رخ داد؛ صفحه در حال تلاش مجدد است',true)}catch(_){}
@@ -923,6 +923,10 @@ window.addEventListener('unhandledrejection',function(e){
 });
 function $(id){return document.getElementById(id)}
 function pad(n){return n<10?'0'+n:''+n}
+function isScheduleEditor(node){return !!(node&&node.matches&&node.matches('input[id^="st"],input[id^="sd"]'))}
+document.addEventListener('pointerdown',function(e){if(isScheduleEditor(e.target)){scheduleEditLock=true}else if(scheduleEditLock){scheduleEditLock=false}},true);
+document.addEventListener('focusin',function(e){if(isScheduleEditor(e.target))scheduleEditLock=true},true);
+document.addEventListener('focusout',function(e){if(isScheduleEditor(e.target)&&e.relatedTarget){scheduleEditLock=isScheduleEditor(e.relatedTarget)}},true);
 
 function setDid(id){did=id;updateDot();refresh()}
 
@@ -1023,6 +1027,7 @@ function renderOverview(){
 }
 function escapeHtml(value){return String(value).replace(/[&<>"']/g,function(ch){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]})}
 function renderIrrigation(){
+  if(scheduleEditLock)return;
   var d=st&&st.deviceInfo?st.deviceInfo[did]:null,irr=d&&d.irrigation?d.irrigation:null;
   if(!irr||!irr.zones){$('pg-irrigation').innerHTML='<div class="card"><div class="ct">ماژول آبیاری فعال نیست</div></div>';return}
   var h='';
@@ -1031,7 +1036,7 @@ function renderIrrigation(){
   h+='<div class="cnv-wrap"><div class="cnv-t">📊 مصرف آب ۲۴ ساعته</div><canvas class="cnv" id="cvWater" width="600" height="70"></canvas><div style="text-align:center;font-size:.65rem;color:var(--muted);margin-top:4px" id="cvLeg"></div></div>';
   var zones=irr.zones||[];
   zones.forEach(function(z){
-    h+='<div class="card"><div class="ch"><span class="ct">💧 زون '+z.id+' • GPIO'+z.pin+'</span><span class="stg '+(z.running?'run':'off')+'">'+(z.running?'فعال ('+z.remainingSec+'ث)':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">بعدی: '+(z.nextRun||'--')+' | فعال: '+(z.enabled?'بله':'خیر')+' | اجرا امروز: '+(z.ranToday?'بله':'خیر')+'</div><div class="fr"><button class="bt g sm" onclick="act(\\'zone/on\\',{id:'+z.id+',dur:'+(z.duration||15)+'})">روشن</button><button class="bt r sm" onclick="act(\\'zone/off\\',{id:'+z.id+'})">خاموش</button></div><div class="fr"><input type="time" id="st'+z.id+'" value="'+pad(z.hour)+':'+pad(z.minute)+'"><input type="number" id="sd'+z.id+'" value="'+(z.duration||15)+'" min="1" max="480"><span style="font-size:.7rem;color:var(--muted)">دقیقه</span><button class="bt b sm" onclick="setSch('+z.id+')">تنظیم</button></div></div>'
+    h+='<div class="card"><div class="ch"><span class="ct">💧 زون '+z.id+' • GPIO'+z.pin+'</span><span class="stg '+(z.running?'run':'off')+'">'+(z.running?'فعال ('+z.remainingSec+'ث)':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">بعدی: '+(z.nextRun||'--')+' | فعال: '+(z.enabled?'بله':'خیر')+' | اجرا امروز: '+(z.ranToday?'بله':'خیر')+'</div><div class="fr"><button class="bt g sm" onclick="act(\\'zone/on\\',{id:'+z.id+',dur:'+(z.duration||15)+'})">روشن</button><button class="bt r sm" onclick="act(\\'zone/off\\',{id:'+z.id+'})">خاموش</button></div><div class="fr"><input type="time" id="st'+z.id+'" value="'+pad(z.hour)+':'+pad(z.minute)+'"><input type="number" id="sd'+z.id+'" value="'+(z.duration||15)+'" min="1" max="480"><span style="font-size:.7rem;color:var(--muted)">دقیقه</span><button class="bt b sm" onclick="setSch('+z.id+')">تنظیم</button></div><div style="font-size:.7rem;color:var(--muted);margin-top:6px">قاعده: آبیاری زمان‌بندی‌شده فقط با رطوبت معتبر کمتر از ۲۰٪ اجرا می‌شود؛ در غیر این صورت این نوبت رد و در زمان‌بندی بعدی دوباره بررسی می‌شود.</div></div>'
   });
   $('pg-irrigation').innerHTML=h
 }

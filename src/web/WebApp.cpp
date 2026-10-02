@@ -336,9 +336,29 @@ main{max-width:640px;margin:auto;padding:16px}
 // --- State ---
 let st = null; // last status JSON
 let page = 'irrigation';
+let scheduleEditLock = false;
 
 // --- Smart DOM patching ---
 function $(id){return document.getElementById(id)}
+function isScheduleEditor(node){
+  return !!(node&&node.matches&&node.matches('input[id^="sch-t"],input[id^="sch-d"]'));
+}
+document.addEventListener('pointerdown',function(e){
+  if(isScheduleEditor(e.target)){
+    scheduleEditLock=true;
+  }else if(scheduleEditLock){
+    scheduleEditLock=false;
+  }
+},true);
+document.addEventListener('focusin',function(e){
+  if(isScheduleEditor(e.target)){
+    scheduleEditLock=true;
+  }
+},true);
+document.addEventListener('focusout',function(e){
+  if(isScheduleEditor(e.target)&&isScheduleEditor(e.relatedTarget))scheduleEditLock=true;
+  else if(isScheduleEditor(e.target)&&e.relatedTarget)scheduleEditLock=false;
+},true);
 function isFocusedInside(id){
   var ae=document.activeElement;
   if(!ae)return false;
@@ -407,7 +427,7 @@ function renderInsights(s){
 // --- Irrigation page ---
 function renderIrrigation(s){
   const irr=s.irrigation;
-  if(isFocusedInside('pg-irrigation'))return;
+  if(scheduleEditLock||isFocusedInside('pg-irrigation'))return;
   if(!irr){$('pg-irrigation').innerHTML='<div class="card"><span class="ttl">Irrigation inactive</span></div>';return;}
 
   let html='';
@@ -441,7 +461,7 @@ function renderIrrigation(s){
     html+='<input type="number" id="sch-d'+z.id+'" value="'+(z.duration||15)+'" min="1" max="120" style="width:45px">';
     html+='<span style="font-size:.72rem;color:var(--muted)">min</span>';
     html+='<button class="bt bt-o" onclick="setSchedule('+z.id+')">Set</button>';
-    html+='</div></div>';
+    html+='</div><div style="font-size:.72rem;color:var(--muted);margin-top:7px">Scheduled watering runs only below 20% soil moisture; otherwise this slot is skipped until the next schedule.</div></div>';
   });
   $('pg-irrigation').innerHTML=html;
 }

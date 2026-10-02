@@ -86,6 +86,7 @@ private:
 
   // Soil sensor
   int soilRaw = 0;
+  bool soilValid = false;
   uint32_t lastSoilRead = 0;
   static constexpr uint8_t soilPowerPin = 33;
   static constexpr uint8_t soilAdcPin   = 34;

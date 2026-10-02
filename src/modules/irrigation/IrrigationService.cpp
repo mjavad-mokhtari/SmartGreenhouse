@@ -85,6 +85,7 @@ void IrrigationService::readSoil(uint32_t now) {
   delay(10);
   soilRaw = analogRead(soilAdcPin);
   digitalWrite(soilPowerPin, LOW);
+  soilValid = soilRaw > 0 && soilRaw < 4095;
 }
 
 int IrrigationService::soilPercent() const {
@@ -250,6 +251,18 @@ void IrrigationService::checkSchedules(uint32_t now) {
     z.lastRunDate = dateKey;
     z.ranToday = true;
     save();
+    // Scheduled irrigation is allowed only when a valid soil sample is below 20%.
+    // Skips consume today's slot: a later moisture drop waits for the next schedule.
+    if (!soilValid) {
+      queueEvent("schedule", String("skip zone") + String(z.id) + ": soil sensor invalid; waiting for next schedule");
+      continue;
+    }
+    const int moisture = soilPercent();
+    if (moisture >= 20) {
+      queueEvent("schedule", String("skip zone") + String(z.id) + ": soil " + String(moisture) + "% (requires <20%); waiting for next schedule");
+      continue;
+    }
+    queueEvent("schedule", String("allow zone") + String(z.id) + ": soil " + String(moisture) + "% (<20%)");
     queueEvent("zone", String("scheduled zone") + String(z.id) + " " + (z.hour < 10 ? "0" : "") + String(z.hour) + ":" + (z.minute < 10 ? "0" : "") + String(z.minute));
     if (!start(i, z.duration, "SCHEDULED")) {
       z.lastRunDate = 0;
