@@ -182,6 +182,9 @@ bool IrrigationService::setSchedule(int idx, uint8_t hour, uint8_t minute, uint1
   z.hour = hour;
   z.minute = minute;
   z.duration = durationMin;
+  // Saving a schedule from the dashboard is the user's intent to run it.
+  // Previously this stayed false after boot, making the saved time inert.
+  z.enabled = true;
   for (int d = 1; d <= 7; d++) z.days[d] = true;
   save();
   return true;
@@ -213,14 +216,6 @@ String IrrigationService::nextRun(int idx) const {
 }
 
 void IrrigationService::checkSchedules(uint32_t now) {
-  DateTime n = rtc.now();
-  static int lastDay = -1;
-
-  if (n.day() != lastDay) {
-    lastDay = n.day();
-    for (uint8_t i = 0; i < zoneN; i++) zones[i].ranToday = false;
-  }
-
   // Check time-based completion
   for (uint8_t i = 0; i < zoneN; i++) {
     if (zones[i].running) {
@@ -232,6 +227,13 @@ void IrrigationService::checkSchedules(uint32_t now) {
     }
   }
 
+  // A failed or disconnected RTC must never cause a time-based irrigation run.
+  if (!rtc.isAvailable()) return;
+
+  DateTime n = rtc.now();
+  const uint32_t dateKey = (uint32_t)n.year() * 10000UL + (uint32_t)n.month() * 100UL + n.day();
+  for (uint8_t i = 0; i < zoneN; i++) zones[i].ranToday = zones[i].lastRunDate == dateKey;
+
   // Check schedule-based starts
   for (uint8_t i = 0; i < zoneN; i++) {
     Zone& z = zones[i];
@@ -239,10 +241,22 @@ void IrrigationService::checkSchedules(uint32_t now) {
     if (!z.enabled) continue;
     if (z.ranToday) continue;
     if (!z.days[day7(n.dayOfTheWeek())]) continue;
-    if (n.hour() != z.hour || n.minute() != z.minute) continue;
+    const int scheduledMinute = (int)z.hour * 60 + z.minute;
+    const int currentMinute = (int)n.hour() * 60 + n.minute();
+    if (currentMinute < scheduledMinute) continue;
+    // Allow brief loop/network stalls, but never replay a stale schedule hours later.
+    const uint32_t latenessSeconds = (uint32_t)(currentMinute - scheduledMinute) * 60UL + n.second();
+    if (latenessSeconds > 90) continue;
+    z.lastRunDate = dateKey;
     z.ranToday = true;
+    save();
     queueEvent("zone", String("scheduled zone") + String(z.id) + " " + (z.hour < 10 ? "0" : "") + String(z.hour) + ":" + (z.minute < 10 ? "0" : "") + String(z.minute));
-    start(i, z.duration, "SCHEDULED");
+    if (!start(i, z.duration, "SCHEDULED")) {
+      z.lastRunDate = 0;
+      z.ranToday = false;
+      save();
+      queueEvent("schedule", String("failed zone") + String(z.id));
+    }
   }
 }
 
@@ -260,6 +274,7 @@ void IrrigationService::save() {
     p.putUChar((keyBase + "h").c_str(), z.hour);
     p.putUChar((keyBase + "m").c_str(), z.minute);
     p.putUShort((keyBase + "dur").c_str(), z.duration);
+    p.putUInt((keyBase + "rd").c_str(), z.lastRunDate);
     for (int d = 1; d <= 7; d++)
       p.putBool((keyBase + "d" + String(d)).c_str(), z.days[d]);
   }
@@ -280,6 +295,7 @@ void IrrigationService::load() {
     z.hour     = p.getUChar((keyBase + "h").c_str(), 8);
     z.minute   = p.getUChar((keyBase + "m").c_str(), 0);
     z.duration = p.getUShort((keyBase + "dur").c_str(), 15);
+    z.lastRunDate = p.getUInt((keyBase + "rd").c_str(), 0);
     for (int d = 1; d <= 7; d++)
       z.days[d] = p.getBool((keyBase + "d" + String(d)).c_str(), true);
     z.running = false;

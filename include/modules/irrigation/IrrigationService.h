@@ -12,6 +12,7 @@ struct Zone {
   bool enabled;
   bool days[8];      // index 1..7 = Sat..Fri
   bool ranToday;
+  uint32_t lastRunDate; // YYYYMMDD, persisted to prevent duplicate daily runs after reboot
   bool running;
   uint8_t hour, minute;
   uint16_t duration;  // minutes

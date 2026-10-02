@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const session = require('express-session');
 const crypto = require('crypto');
+const { TelemetryStore, buildInsights } = require('./analytics');
 
 // --------------- Config ---------------
 const PORT = process.env.PORT || 3000;
@@ -15,6 +16,7 @@ const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const FIRMWARE_DIR = path.join(__dirname, 'firmware');
 const COMMANDS_FILE = path.join(DATA_DIR, 'commands.json');
 const COMMAND_RESULTS_FILE = path.join(DATA_DIR, 'command-results.json');
+const TELEMETRY_FILE = path.join(DATA_DIR, 'telemetry.json');
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const MAX_EVENTS = 20000;
 const ACTUATION_TTL_MS = 30 * 1000;
@@ -30,9 +32,13 @@ let deviceStates = {};
 let users = [];
 let commands = {};
 let commandResults = {};
+const telemetryStore = new TelemetryStore(TELEMETRY_FILE);
+let analyticsCache = null;
+let analyticsCacheAt = 0;
 
 function initStore() {
   [DATA_DIR, FIRMWARE_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+  telemetryStore.load();
   try { events = JSON.parse(fs.readFileSync(EVENTS_FILE, 'utf8') || '[]'); } catch(e) { events = []; }
   try { deviceStates = JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8') || '{}'); } catch(e) { deviceStates = {}; }
   try { users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8') || '[]'); } catch(e) { users = []; }
@@ -469,6 +475,7 @@ app.post('/api/events', requireApiKey, (req, res) => {
       ip: req.ip,
       status: devStatus && typeof devStatus === 'object' ? devStatus : (devStatus || {})
     };
+    if (devStatus && typeof devStatus === 'object') telemetryStore.record(deviceId, devStatus, receivedAt);
     saveDevices();
     return res.json({ ok: true, received: 0, note: 'no-events' });
   }
@@ -480,6 +487,7 @@ app.post('/api/events', requireApiKey, (req, res) => {
     ip: req.ip,
     status: devStatus && typeof devStatus === 'object' ? devStatus : (devStatus || {})
   };
+  if (devStatus && typeof devStatus === 'object') telemetryStore.record(deviceId, devStatus, receivedAt);
   saveDevices();
   let received = 0;
   if (evts && evts.length > 0) { for (const e of evts) { addEvent(deviceId, e.type, e.state, e.ts); received++; } }
@@ -702,10 +710,19 @@ app.get('/api/status-full', (req, res) => {
     allEvents: events.slice(-120),
     timeline: getTimelineData(),
     stats: getStats(),
+    analytics: getCachedAnalytics(deviceInfo, now),
     pendingCommands: Object.fromEntries(Object.keys(commands).map((id) => [id, (commands[id] || []).length])),
     recentCommands: commandResults
   });
 });
+
+function getCachedAnalytics(deviceInfo, now) {
+  if (!analyticsCache || now - analyticsCacheAt >= 60000) {
+    analyticsCache = buildInsights(telemetryStore.points, events, deviceInfo, now);
+    analyticsCacheAt = now;
+  }
+  return analyticsCache;
+}
 
 function getIrrigationDataFor(irrigation) {
   if (!irrigation) return null;
@@ -997,8 +1014,14 @@ function renderOverview(){
   var h='<div class="card"><span class="ct">📊 وضعیت سیستم</span><div style="font-size:.8rem;color:var(--sub);line-height:1.8">';
   h+='دستگاه‌ها: '+s.devices+'<br>رویداد امروز: '+s.todayEvents+'<br>کل رویدادها: '+s.totalEvents+'<br>دقیقه آبیاری: '+(s.irrigationMinutes||0)+'</div></div>';
   h+='<div class="card"><span class="ct">🖥 دستگاه‌ها</span><div style="font-size:.78rem;color:var(--sub);line-height:1.8">'+ol+'</div></div>';
+  var a=st.analytics||{},ins=a.insights||[];
+  h+='<div class="card"><span class="ct">🧠 تحلیل الگوها • فقط پیشنهاد</span><div style="font-size:.72rem;color:var(--muted);margin:4px 0 8px">'+(a.sampleCount||0)+' نمونهٔ نگهداری‌شده؛ اجرای خودکار آبیاری غیرفعال است.</div>';
+  if(ins.length){ins.forEach(function(x){h+='<div style="border-top:1px solid var(--border);padding:8px 0"><b>'+escapeHtml(x.title||'پیشنهاد')+'</b><div style="font-size:.76rem;color:var(--sub);margin-top:4px">'+escapeHtml(x.detail||'')+'</div></div>'})}
+  else h+='<div style="font-size:.78rem;color:var(--sub)">هنوز الگوی قابل‌اعتماد پیدا نشده؛ با جمع‌شدن تاریخچهٔ بیشتر، پیشنهادهای مبتنی بر داده نمایش داده می‌شوند.</div>';
+  h+='</div>';
   $('pg-overview').innerHTML=h
 }
+function escapeHtml(value){return String(value).replace(/[&<>"']/g,function(ch){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]})}
 function renderIrrigation(){
   var d=st&&st.deviceInfo?st.deviceInfo[did]:null,irr=d&&d.irrigation?d.irrigation:null;
   if(!irr||!irr.zones){$('pg-irrigation').innerHTML='<div class="card"><div class="ct">ماژول آبیاری فعال نیست</div></div>';return}
