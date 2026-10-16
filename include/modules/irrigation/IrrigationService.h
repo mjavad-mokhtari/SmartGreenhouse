@@ -69,6 +69,8 @@ public:
   // Soil sensor
   int soilRawValue() const { return soilRaw; }
   int soilPercent() const;
+  uint8_t soilThresholdPercent() const { return soilThreshold; }
+  bool setSoilThresholdPercent(uint8_t threshold);
 
   // LED feedback — delegate to StatusLed
   void triggerLed();
@@ -87,6 +89,7 @@ private:
   // Soil sensor
   int soilRaw = 0;
   bool soilValid = false;
+  uint8_t soilThreshold = 20;
   uint32_t lastSoilRead = 0;
   static constexpr uint8_t soilPowerPin = 33;
   static constexpr uint8_t soilAdcPin   = 34;

@@ -160,6 +160,28 @@ void WebApp::handleZoneSchedule(AsyncWebServerRequest* request) {
   }
 }
 
+void WebApp::handleSoilThreshold(AsyncWebServerRequest* request) {
+  String value = request->arg("percent");
+  if (value.length() == 0) value = request->arg("threshold");
+  if (value.length() == 0) {
+    sendJson(request, "{\"ok\":false,\"error\":\"percent required\"}", 400);
+    return;
+  }
+  value.trim();
+  for (size_t i = 0; i < value.length(); i++) {
+    if (value[i] < '0' || value[i] > '9') {
+      sendJson(request, "{\"ok\":false,\"error\":\"percent must be an integer from 0 to 100\"}", 400);
+      return;
+    }
+  }
+  const int threshold = value.toInt();
+  if (threshold < 0 || threshold > 100 || !irrigation.setSoilThresholdPercent((uint8_t)threshold)) {
+    sendJson(request, "{\"ok\":false,\"error\":\"percent must be 0..100\"}", 400);
+    return;
+  }
+  sendJson(request, String("{\"ok\":true,\"soilThresholdPercent\":") + String(threshold) + "}");
+}
+
 void WebApp::handlePumpOn(AsyncWebServerRequest* request) {
   irrigation.clearPumpOverride();
   irrigation.setPump(true, "HTTP manual start");
@@ -341,7 +363,7 @@ let scheduleEditLock = false;
 // --- Smart DOM patching ---
 function $(id){return document.getElementById(id)}
 function isScheduleEditor(node){
-  return !!(node&&node.matches&&node.matches('input[id^="sch-t"],input[id^="sch-d"]'));
+  return !!(node&&node.matches&&node.matches('input[id^="sch-t"],input[id^="sch-d"],input[id="soil-threshold"]'));
 }
 document.addEventListener('pointerdown',function(e){
   if(isScheduleEditor(e.target)){
@@ -443,7 +465,11 @@ function renderIrrigation(s){
   // Soil
   html+='<div class="card"><span class="ttl">Soil Sensor</span>';
   html+='<div class="n'+(irr.soilPercent<30?' danger':'')+'">'+irr.soilPercent+'%</div>';
-  html+='<span style="font-size:.75rem;color:var(--muted)">Raw: '+irr.soilRaw+'</span></div>';
+  html+='<span style="font-size:.75rem;color:var(--muted)">Raw: '+irr.soilRaw+'</span>';
+  html+='<div class="fr"><label for="soil-threshold" style="font-size:.75rem;color:var(--muted)">Scheduled watering threshold (%)</label>';
+  html+='<input type="number" id="soil-threshold" value="'+(irr.soilThresholdPercent==null?20:irr.soilThresholdPercent)+'" min="0" max="100" inputmode="numeric" style="width:64px">';
+  html+='<button class="bt bt-o" onclick="saveSoilThreshold()">Save rule</button></div>';
+  html+='<span style="font-size:.7rem;color:var(--muted)">Runs when soil moisture is less than or equal to this value. A skipped schedule waits until the next scheduled time.</span></div>';
 
   // Zones
   const zones=irr.zones||[];
@@ -461,7 +487,7 @@ function renderIrrigation(s){
     html+='<input type="number" id="sch-d'+z.id+'" value="'+(z.duration||15)+'" min="1" max="120" style="width:45px">';
     html+='<span style="font-size:.72rem;color:var(--muted)">min</span>';
     html+='<button class="bt bt-o" onclick="setSchedule('+z.id+')">Set</button>';
-    html+='</div><div style="font-size:.72rem;color:var(--muted);margin-top:7px">Scheduled watering runs only below 20% soil moisture; otherwise this slot is skipped until the next schedule.</div></div>';
+  html+='</div><div style="font-size:.72rem;color:var(--muted);margin-top:7px">Scheduled watering runs when soil moisture is less than or equal to '+(irr.soilThresholdPercent==null?20:irr.soilThresholdPercent)+'%; otherwise this slot is skipped until the next schedule.</div></div>';
   });
   $('pg-irrigation').innerHTML=html;
 }
@@ -551,6 +577,14 @@ function setSchedule(id){
     if(j.ok){refresh();}
     else {alert('Failed');}
   });
+}
+function saveSoilThreshold(){
+  var input=$('soil-threshold'),value=input?Number(input.value):NaN;
+  if(!Number.isInteger(value)||value<0||value>100){alert('Enter a whole-number threshold from 0 to 100%');return;}
+  fetch('/api/config/soil-threshold?percent='+value,{method:'POST'}).then(r=>r.json()).then(j=>{
+    if(j.ok){scheduleEditLock=false;refresh();}
+    else alert(j.error||'Could not save threshold');
+  }).catch(()=>alert('Could not save threshold'));
 }
 function saveWifi(){
   const ss=document.getElementById('ssid-in').value;
@@ -651,6 +685,7 @@ void WebApp::begin() {
   server.on("/api/zone/off", HTTP_POST, zoneoff);
   server.on("/api/zone/add", HTTP_POST, zoneadd);
   server.on("/api/zone/schedule", HTTP_POST, zonesch);
+  server.on("/api/config/soil-threshold", HTTP_POST, [this](AsyncWebServerRequest* r) { handleSoilThreshold(r); });
   server.on("/api/pump/on", HTTP_POST, pumpon);
   server.on("/api/pump/off", HTTP_POST, pumpoff);
   server.on("/api/e", HTTP_POST, alloff);

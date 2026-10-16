@@ -45,3 +45,35 @@ Open `http://localhost:3000/`. Configure the controller's server URL as
 `http://<server-ip>:3000/`. The server stores events in `server/greenhouse.db`;
 remote control and retention deletion require the same `API_KEY` via the
 `X-API-Key` header.
+
+### Deploy on VPS
+
+On the VPS, from repo root run:
+
+```sh
+./deploy.sh
+```
+
+or (if you want push + deploy):
+
+```sh
+./push-and-deploy.sh
+```
+
+Optional env vars for Telegram/n8n notification:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `N8N_WEBHOOK_URL`
+
+You can make notifications persistent by creating `.deploy.env` in repo root:
+
+```bash
+cat > .deploy.env <<'EOF'
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+N8N_WEBHOOK_URL=https://your-n8n-webhook
+EOF
+```
+
+Then run `./deploy.sh` or `./push-and-deploy.sh` and notifications will fire automatically.

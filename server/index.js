@@ -553,6 +553,15 @@ app.post('/api/zone/schedule', requireControl, (req, res) => {
   respondQueuedCommand(res, deviceId, 'zone/schedule', { id: zoneId, hour, minute, dur });
 });
 
+app.post('/api/config/soil-threshold', requireControl, (req, res) => {
+  const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
+  if (!deviceId) return res.status(400).json({ error: 'device not found' });
+  const percent = Number(req.body.percent ?? req.body.threshold ?? req.query.percent ?? req.query.threshold);
+  if (!Number.isInteger(percent) || percent < 0 || percent > 100)
+    return res.status(400).json({ error: 'percent must be an integer from 0 to 100' });
+  respondQueuedCommand(res, deviceId, 'config/soil-threshold', { percent });
+});
+
 app.post('/api/zone/add', requireControl, (req, res) => {
   const deviceId = pickDeviceId(req.body.deviceId || req.query.deviceId);
   if (!deviceId) return res.status(400).json({ error: 'device not found' });
@@ -678,9 +687,7 @@ app.post('/api/commands/ack', requireApiKey, (req, res) => {
 
 // Irrigation timeline data
 app.get('/api/irrigation/timeline', (req, res) => {
-  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-  const today = events.filter(e => e.received_at >= todayStart.getTime());
-  res.json({ periods: getTimelineData() });
+  res.json({ periods: getTimelineData(), history: getIrrigationHistory(7) });
 });
 
 // === FULL STATUS for new dashboard ===
@@ -709,6 +716,7 @@ app.get('/api/status-full', (req, res) => {
     deviceInfo,
     allEvents: events.slice(-120),
     timeline: getTimelineData(),
+    irrigationHistory: getIrrigationHistory(7),
     stats: getStats(),
     analytics: getCachedAnalytics(deviceInfo, now),
     pendingCommands: Object.fromEntries(Object.keys(commands).map((id) => [id, (commands[id] || []).length])),
@@ -784,7 +792,7 @@ function getTimelineData() {
         pumpOn = null;
       }
     }
-    if (e.event_type === 'zone') {
+    if (e.event_type === 'zone' && /^start\s+zone\d+/i.test(String(e.state || ''))) {
       const m = e.state.match(/(\d+)\s*min/i);
       const dur = m ? parseInt(m[1]) : 15;
       const zid = e.state.match(/zone\s*(\d+)/i);
@@ -793,6 +801,49 @@ function getTimelineData() {
   }
   if (pumpOn) periods.push({ type: 'pump', start: pumpOn, end: Date.now(), active: true });
   return periods;
+}
+
+function getIrrigationHistory(days = 7) {
+  const count = Math.max(1, Math.min(31, Number(days) || 7));
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - (count - 1));
+  const startTs = start.getTime();
+  const buckets = [];
+  const byDate = new Map();
+  for (let i = 0; i < count; i++) {
+    const day = new Date(startTs + i * 86400000);
+    const date = [day.getFullYear(), String(day.getMonth() + 1).padStart(2, '0'), String(day.getDate()).padStart(2, '0')].join('-');
+    const bucket = {
+      date,
+      label: new Intl.DateTimeFormat('fa-IR', { weekday: 'short', day: 'numeric', month: 'short' }).format(day),
+      runs: 0,
+      minutes: 0,
+      periods: []
+    };
+    buckets.push(bucket);
+    byDate.set(date, bucket);
+  }
+  for (const event of events) {
+    const ts = Number(event.received_at || event.ts);
+    if (!Number.isFinite(ts) || ts < startTs || event.event_type !== 'zone') continue;
+    const day = new Date(ts);
+    const date = [day.getFullYear(), String(day.getMonth() + 1).padStart(2, '0'), String(day.getDate()).padStart(2, '0')].join('-');
+    const bucket = byDate.get(date);
+    if (!bucket || !/^start\s+zone\d+/i.test(String(event.state || ''))) continue;
+    const match = String(event.state || '').match(/(\d+)\s*min/i);
+    const minutes = match ? Math.max(1, parseInt(match[1], 10)) : 15;
+    const zone = String(event.state).match(/zone\s*(\d+)/i);
+    bucket.runs += 1;
+    bucket.minutes += minutes;
+    bucket.periods.push({
+      zoneId: zone ? zone[1] : '?',
+      start: ts,
+      end: ts + minutes * 60000,
+      minutes
+    });
+  }
+  return buckets;
 }
 
 // Dashboard
@@ -923,7 +974,7 @@ window.addEventListener('unhandledrejection',function(e){
 });
 function $(id){return document.getElementById(id)}
 function pad(n){return n<10?'0'+n:''+n}
-function isScheduleEditor(node){return !!(node&&node.matches&&node.matches('input[id^="st"],input[id^="sd"]'))}
+function isScheduleEditor(node){return !!(node&&node.matches&&node.matches('input[id^="st"],input[id^="sd"],input[id="soil-threshold"]'))}
 document.addEventListener('pointerdown',function(e){if(isScheduleEditor(e.target)){scheduleEditLock=true}else if(scheduleEditLock){scheduleEditLock=false}},true);
 document.addEventListener('focusin',function(e){if(isScheduleEditor(e.target))scheduleEditLock=true},true);
 document.addEventListener('focusout',function(e){if(isScheduleEditor(e.target)&&e.relatedTarget){scheduleEditLock=isScheduleEditor(e.relatedTarget)}},true);
@@ -1032,11 +1083,12 @@ function renderIrrigation(){
   if(!irr||!irr.zones){$('pg-irrigation').innerHTML='<div class="card"><div class="ct">ماژول آبیاری فعال نیست</div></div>';return}
   var h='';
   h+='<div class="card"><div class="ch"><span class="ct">⛽ پمپ • GPIO '+irr.pumpGpio+'</span><span class="stg '+(irr.pumpOn?'run':'off')+'">'+(irr.pumpOn?'فعال':'خاموش')+'</span></div><div class="fr"><button class="bt g" onclick="act(\\'pump/on\\')">روشن</button><button class="bt r" onclick="act(\\'pump/off\\')">خاموش</button></div></div>';
-  if(irr.soilPercent!=null)h+='<div class="card"><span class="ct">🌱 سنسور رطوبت خاک</span><div style="font-size:1.5rem;font-weight:700;color:'+(irr.soilPercent<30?'var(--danger)':'var(--accent)')+'">'+irr.soilPercent+'%</div><div style="font-size:.7rem;color:var(--muted)">خام: '+irr.soilRaw+'</div></div>';
-  h+='<div class="cnv-wrap"><div class="cnv-t">📊 مصرف آب ۲۴ ساعته</div><canvas class="cnv" id="cvWater" width="600" height="70"></canvas><div style="text-align:center;font-size:.65rem;color:var(--muted);margin-top:4px" id="cvLeg"></div></div>';
+  if(irr.soilPercent!=null)h+='<div class="card"><span class="ct">🌱 سنسور رطوبت خاک</span><div style="font-size:1.5rem;font-weight:700;color:'+(irr.soilPercent<30?'var(--danger)':'var(--accent)')+'">'+irr.soilPercent+'%</div><div style="font-size:.7rem;color:var(--muted)">خام: '+irr.soilRaw+'</div><div class="fr"><label for="soil-threshold" style="font-size:.7rem;color:var(--muted)">آستانهٔ آبیاری زمان‌بندی‌شده (%)</label><input type="number" id="soil-threshold" value="'+(irr.soilThresholdPercent==null?20:irr.soilThresholdPercent)+'" min="0" max="100" inputmode="numeric" style="width:64px"><button class="bt b sm" onclick="saveSoilThreshold()">ذخیره</button></div><div style="font-size:.68rem;color:var(--muted);margin-top:5px">اگر رطوبت کمتر یا مساوی این درصد باشد، آبیاری زمان‌بندی‌شده اجازهٔ اجرا دارد؛ در غیر این صورت نوبت رد می‌شود.</div></div>';
+  var hist=st&&st.irrigationHistory?st.irrigationHistory:[],totalRuns=hist.reduce(function(a,x){return a+(x.runs||0)},0),totalMinutes=hist.reduce(function(a,x){return a+(x.minutes||0)},0);
+  h+='<div class="card"><div class="ch"><span class="ct">📊 تاریخچه آبیاری ۷ روزه</span><span class="stg '+(totalRuns?'run':'off')+'">'+totalRuns+' نوبت • '+totalMinutes+' دقیقه</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">ستون بلندتر یعنی دقیقهٔ آبیاری بیشتر؛ عدد بالای ستون تعداد دفعات همان روز است.</div><canvas class="cnv" id="cvWater" width="600" height="150"></canvas><div style="text-align:center;font-size:.65rem;color:var(--muted);margin-top:4px" id="cvLeg"></div></div>';
   var zones=irr.zones||[];
   zones.forEach(function(z){
-    h+='<div class="card"><div class="ch"><span class="ct">💧 زون '+z.id+' • GPIO'+z.pin+'</span><span class="stg '+(z.running?'run':'off')+'">'+(z.running?'فعال ('+z.remainingSec+'ث)':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">بعدی: '+(z.nextRun||'--')+' | فعال: '+(z.enabled?'بله':'خیر')+' | اجرا امروز: '+(z.ranToday?'بله':'خیر')+'</div><div class="fr"><button class="bt g sm" onclick="act(\\'zone/on\\',{id:'+z.id+',dur:'+(z.duration||15)+'})">روشن</button><button class="bt r sm" onclick="act(\\'zone/off\\',{id:'+z.id+'})">خاموش</button></div><div class="fr"><input type="time" id="st'+z.id+'" value="'+pad(z.hour)+':'+pad(z.minute)+'"><input type="number" id="sd'+z.id+'" value="'+(z.duration||15)+'" min="1" max="480"><span style="font-size:.7rem;color:var(--muted)">دقیقه</span><button class="bt b sm" onclick="setSch('+z.id+')">تنظیم</button></div><div style="font-size:.7rem;color:var(--muted);margin-top:6px">قاعده: آبیاری زمان‌بندی‌شده فقط با رطوبت معتبر کمتر از ۲۰٪ اجرا می‌شود؛ در غیر این صورت این نوبت رد و در زمان‌بندی بعدی دوباره بررسی می‌شود.</div></div>'
+    h+='<div class="card"><div class="ch"><span class="ct">💧 زون '+z.id+' • GPIO'+z.pin+'</span><span class="stg '+(z.running?'run':'off')+'">'+(z.running?'فعال ('+z.remainingSec+'ث)':'خاموش')+'</span></div><div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">بعدی: '+(z.nextRun||'--')+' | فعال: '+(z.enabled?'بله':'خیر')+' | اجرا امروز: '+(z.ranToday?'بله':'خیر')+'</div><div class="fr"><button class="bt g sm" onclick="act(\\'zone/on\\',{id:'+z.id+',dur:'+(z.duration||15)+'})">روشن</button><button class="bt r sm" onclick="act(\\'zone/off\\',{id:'+z.id+'})">خاموش</button></div><div class="fr"><input type="time" id="st'+z.id+'" value="'+pad(z.hour)+':'+pad(z.minute)+'"><input type="number" id="sd'+z.id+'" value="'+(z.duration||15)+'" min="1" max="480"><span style="font-size:.7rem;color:var(--muted)">دقیقه</span><button class="bt b sm" onclick="setSch('+z.id+')">تنظیم</button></div><div style="font-size:.7rem;color:var(--muted);margin-top:6px">قاعده: اگر رطوبت معتبر کمتر یا مساوی '+(irr.soilThresholdPercent==null?20:irr.soilThresholdPercent)+'٪ باشد اجرا می‌شود؛ اگر بیشتر باشد این نوبت رد و در زمان‌بندی بعدی دوباره بررسی می‌شود.</div></div>'
   });
   $('pg-irrigation').innerHTML=h
 }
@@ -1075,6 +1127,11 @@ function renderSettings(){
 function setSch(id){
   var t=$('st'+id),d=$('sd'+id);if(!t||!d)return;
   var v=t.value.split(':');act('zone/schedule',{id:id,hour:parseInt(v[0]),minute:parseInt(v[1]),dur:parseInt(d.value)})
+}
+function saveSoilThreshold(){
+  var input=$('soil-threshold'),percent=input?Number(input.value):NaN;
+  if(!Number.isInteger(percent)||percent<0||percent>100){toast('درصد باید عدد صحیح بین ۰ تا ۱۰۰ باشد',true);return}
+  act('config/soil-threshold',{percent:percent});
 }
 function saveSync(){act('config/sync',{url:$('syncUrl').value})}
 function setRTC(){act('config/time',{year:$('rtcY').value,month:$('rtcM').value,day:$('rtcD').value,hour:$('rtcH').value,minute:$('rtcMi').value})}
@@ -1135,26 +1192,22 @@ function drawCharts(){
 
 function drawWaterTimeline(){
   var c=$('cvWater'),ctx=c?c.getContext('2d'):null;if(!ctx)return;
-  var w=c.width,h=c.height;ctx.clearRect(0,0,w,h);
-  ctx.fillStyle='#06080a';ctx.fillRect(0,0,w,h);
-  for(var i=0;i<=24;i+=4){var x=i*w/24;ctx.strokeStyle='rgba(255,255,255,0.06)';ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke()}
-  ctx.fillStyle='#6b7280';ctx.font='9px monospace';ctx.textAlign='center';
-  for(var i=0;i<=24;i+=4)ctx.fillText(i,Math.max(8,i*w/24),h-4);
-  var now=new Date(),ds=new Date();ds.setHours(0,0,0,0);var nx=(now-ds)/86400000*w;
-  ctx.strokeStyle='rgba(239,68,68,0.5)';ctx.beginPath();ctx.moveTo(nx,0);ctx.lineTo(nx,h);ctx.stroke();
-  var tl=st&&st.timeline?st.timeline:[];if(!tl.length){ctx.fillStyle='#6b7280';ctx.font='10px sans-serif';ctx.fillText('امروز آبیاری انجام نشده',w/2,28);if($('cvLeg'))$('cvLeg').textContent='';return}
-  var cols={pump:'#3b82f6',z1:'#10b981',z2:'#f59e0b',z3:'#a78bfa',z4:'#ec4899'};
-  ctx.globalAlpha=0.85;
-  tl.forEach(function(p){
-    var x1=(p.start-ds)/86400000*w,x2=(p.end-ds)/86400000*w;
-    var ck=p.type==='pump'?'pump':('z'+(p.zoneId||'1'));
-    ctx.fillStyle=cols[ck]||cols.z1;
-    ctx.fillRect(Math.max(0,x1),p.type==='pump'?4:26,Math.max(1.5,x2-x1),16);
-    if(x2-x1>25&&p.duration){ctx.fillStyle='#fff';ctx.font='9px sans-serif';ctx.fillText(p.duration+'د',x1+3,p.type==='pump'?16:38)}
+  var w=c.width,h=c.height,pad={l:34,r:10,t:22,b:30},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;
+  ctx.clearRect(0,0,w,h);ctx.fillStyle='#06080a';ctx.fillRect(0,0,w,h);
+  var hist=st&&st.irrigationHistory?st.irrigationHistory:[];
+  if(!hist.length){ctx.fillStyle='#6b7280';ctx.font='10px sans-serif';ctx.textAlign='center';ctx.fillText('هنوز تاریخچه‌ای برای نمایش نیست',w/2,42);return}
+  var max=Math.max(1,Math.max.apply(null,hist.map(function(x){return Number(x.minutes)||0})));
+  ctx.font='9px sans-serif';ctx.textAlign='right';ctx.fillStyle='#6b7280';
+  [0,Math.ceil(max/2),max].forEach(function(v){var y=pad.t+ph-(v/max)*ph;ctx.strokeStyle='rgba(255,255,255,.08)';ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();ctx.fillText(v+'د',pad.l-5,y+3)});
+  var gap=8,bw=Math.max(14,(pw-gap*(hist.length-1))/hist.length);
+  hist.forEach(function(day,i){
+    var x=pad.l+i*(bw+gap),minutes=Number(day.minutes)||0,runs=Number(day.runs)||0;
+    var bh=minutes?Math.max(4,(minutes/max)*ph):2,y=pad.t+ph-bh;
+    ctx.fillStyle=minutes?'#10b981':'rgba(148,163,184,.25)';ctx.fillRect(x,y,bw,bh);
+    if(runs){ctx.fillStyle='#e4e6ea';ctx.font='bold 9px sans-serif';ctx.textAlign='center';ctx.fillText(runs+'×',x+bw/2,Math.max(12,y-5))}
+    ctx.fillStyle='#9ca3af';ctx.font='9px sans-serif';ctx.textAlign='center';ctx.fillText(day.label||day.date.slice(5),x+bw/2,h-9);
   });
-  ctx.globalAlpha=1;
-  var leg=[];tl.forEach(function(p){var t=p.type==='pump'?'⛽ پمپ':'💧 زون '+(p.zoneId||'1');if(leg.indexOf(t)<0)leg.push(t)});
-  if($('cvLeg'))$('cvLeg').innerHTML=leg.map(function(t){return'<span style="margin:0 5px;font-size:.65rem">'+t+'</span>'}).join('')
+  if($('cvLeg'))$('cvLeg').innerHTML='<span style="margin:0 5px;font-size:.65rem">سبز: آبیاری انجام‌شده</span><span style="margin:0 5px;font-size:.65rem">×: تعداد نوبت</span><span style="margin:0 5px;font-size:.65rem">د: دقیقه</span>';
 }
 
 function drawLightTimeline(){

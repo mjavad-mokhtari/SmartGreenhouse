@@ -92,6 +92,17 @@ int IrrigationService::soilPercent() const {
   return constrain(map(soilRaw, 3000, 1400, 0, 100), 0, 100);
 }
 
+bool IrrigationService::setSoilThresholdPercent(uint8_t threshold) {
+  if (threshold > 100) return false;
+  soilThreshold = threshold;
+  Preferences p;
+  p.begin("irrigation", false);
+  p.putUChar("soilTh", soilThreshold);
+  p.end();
+  queueEvent("rule", String("scheduled soil threshold set to ") + String(soilThreshold) + "%");
+  return true;
+}
+
 // --- pump ---
 void IrrigationService::setPump(bool on, const char* why) {
   if (!relayAssigned(PUMP_RELAY_CHANNEL)) { pump = false; return; }
@@ -251,18 +262,18 @@ void IrrigationService::checkSchedules(uint32_t now) {
     z.lastRunDate = dateKey;
     z.ranToday = true;
     save();
-    // Scheduled irrigation is allowed only when a valid soil sample is below 20%.
+    // Scheduled irrigation is allowed when a valid soil sample is at or below the configured threshold.
     // Skips consume today's slot: a later moisture drop waits for the next schedule.
     if (!soilValid) {
       queueEvent("schedule", String("skip zone") + String(z.id) + ": soil sensor invalid; waiting for next schedule");
       continue;
     }
     const int moisture = soilPercent();
-    if (moisture >= 20) {
-      queueEvent("schedule", String("skip zone") + String(z.id) + ": soil " + String(moisture) + "% (requires <20%); waiting for next schedule");
+    if (moisture > soilThreshold) {
+      queueEvent("schedule", String("skip zone") + String(z.id) + ": soil " + String(moisture) + "% (requires <=" + String(soilThreshold) + "%; equal is allowed); waiting for next schedule");
       continue;
     }
-    queueEvent("schedule", String("allow zone") + String(z.id) + ": soil " + String(moisture) + "% (<20%)");
+    queueEvent("schedule", String("allow zone") + String(z.id) + ": soil " + String(moisture) + "% (<= " + String(soilThreshold) + "%)");
     queueEvent("zone", String("scheduled zone") + String(z.id) + " " + (z.hour < 10 ? "0" : "") + String(z.hour) + ":" + (z.minute < 10 ? "0" : "") + String(z.minute));
     if (!start(i, z.duration, "SCHEDULED")) {
       z.lastRunDate = 0;
@@ -298,6 +309,8 @@ void IrrigationService::load() {
   Preferences p;
   p.begin("irrigation", true);
   zoneN = p.getUChar("count", 0);
+  soilThreshold = p.getUChar("soilTh", 20);
+  if (soilThreshold > 100) soilThreshold = 20;
   if (zoneN > ZONE_COUNT) zoneN = ZONE_COUNT;
   for (uint8_t i = 0; i < zoneN; i++) {
     String keyBase = "z" + String(i) + "_";
@@ -342,6 +355,7 @@ void IrrigationService::appendStatus(JsonObject object) const {
   irr["pumpGpio"] = (RELAY_PINS[PUMP_RELAY_CHANNEL] >= 0) ? (int)RELAY_PINS[PUMP_RELAY_CHANNEL] : -1;
   irr["soilRaw"] = soilRaw;
   irr["soilPercent"] = soilPercent();
+  irr["soilThresholdPercent"] = soilThreshold;
 
   JsonArray za = irr.createNestedArray("zones");
   for (uint8_t i = 0; i < zoneN; i++) {

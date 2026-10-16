@@ -330,6 +330,17 @@ void applyRemoteCommand(const String& action, JsonObject params, String& result,
     }
     return;
   }
+  if (action == "config/soil-threshold") {
+    int threshold = params["percent"] | (params["threshold"] | -1);
+    if (threshold < 0 || threshold > 100 || !irrigation.setSoilThresholdPercent((uint8_t)threshold)) {
+      detail = "درصد آستانه باید بین ۰ تا ۱۰۰ باشد";
+    } else {
+      syncTriggerNow();
+      result = "applied";
+      detail = String("آستانه رطوبت برای آبیاری زمان‌بندی‌شده روی ") + String(threshold) + "% ذخیره شد";
+    }
+    return;
+  }
   if (action == "pump/on") {
     irrigation.clearPumpOverride();
     irrigation.setPump(true, "REMOTE");

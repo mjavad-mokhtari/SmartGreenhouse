@@ -49,6 +49,7 @@ private:
   void handleZoneOff(AsyncWebServerRequest* request);
   void handleZoneAdd(AsyncWebServerRequest* request);
   void handleZoneSchedule(AsyncWebServerRequest* request);
+  void handleSoilThreshold(AsyncWebServerRequest* request);
   void handlePumpOn(AsyncWebServerRequest* request);
   void handlePumpOff(AsyncWebServerRequest* request);
   void handleAllOff(AsyncWebServerRequest* request);
